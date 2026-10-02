@@ -1,0 +1,10 @@
+<resources>
+    <color name="window_background">#EEF0F3</color>
+    <color name="launcher_background">#F5A623</color>
+
+    <!-- windowBackground matches the Compose background so there is no
+         flash of the wrong colour before the first frame. -->
+    <style name="Theme.TradeRescue" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+</resources>

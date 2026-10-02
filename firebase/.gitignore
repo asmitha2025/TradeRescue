@@ -1,0 +1,8 @@
+node_modules/
+.firebase/
+.firebaserc
+*.log
+.env
+.env.*
+.tools/
+emulator-data/

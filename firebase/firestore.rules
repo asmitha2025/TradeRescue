@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Nothing reads or writes Firestore directly from a phone. Every change
+    // goes through the Cloud Function, which uses the Admin SDK and is not
+    // subject to these rules.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

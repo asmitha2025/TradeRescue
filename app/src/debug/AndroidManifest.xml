@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Debug builds only: allow plain http so the app can talk to a backend
+         running on your laptop (http://10.0.2.2:8000 from an emulator, or
+         http://<laptop-ip>:8000 from a phone on the same Wi-Fi). Release
+         builds keep cleartext blocked. -->
+    <application
+        android:usesCleartextTraffic="true"
+        tools:replace="android:usesCleartextTraffic" />
+</manifest>

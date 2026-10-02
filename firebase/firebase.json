@@ -1,0 +1,27 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "ignore": ["node_modules", "test", "*.log"]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules",
+    "location": "asia-south1"
+  },
+  "hosting": {
+    "public": "admin",
+    "ignore": ["firebase.json", "**/.*"],
+    "rewrites": [
+      { "source": "/api/**", "function": { "functionId": "api", "region": "asia-south1" } }
+    ]
+  },
+  "emulators": {
+    "functions": { "port": 5001, "host": "0.0.0.0" },
+    "firestore": { "port": 8080 },
+    "hosting": { "port": 5000 },
+    "ui": { "enabled": true },
+    "singleProjectMode": true
+  }
+}

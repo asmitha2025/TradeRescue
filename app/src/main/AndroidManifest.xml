@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Talking to the deployed backend over HTTPS, and watching for the
+         moment the data connection actually drops. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- The actual reason this exists as a native app and not just the web
+         page: sending a real SMS over the cellular network, independent of
+         data connectivity. Dangerous permission: requested at runtime in
+         MainActivity, not just declared here. -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+
+    <!-- Only used on a phone switched into Gateway mode in Settings, where
+         it receives emergency packets on behalf of the backend. Requested
+         when that switch is turned on, never at launch. -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+
+    <!-- Tablets and emulators without a radio can still install and run the
+         app; they use the HTTP fallback for the emergency channel. -->
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="TradeRescue"
+        android:theme="@style/Theme.TradeRescue"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.TradeRescue"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- BROADCAST_SMS is held only by the system, so no other app can
+             fake an incoming SMS to this receiver. -->
+        <receiver
+            android:name=".data.SmsGatewayReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999">
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

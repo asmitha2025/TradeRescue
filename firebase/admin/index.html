@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>TradeRescue Admin</title>
+<style>
+  /* One light theme on purpose: this page is shown on a projector and in
+     screen recordings, where it should look the same on every machine. */
+  :root {
+    color-scheme: light;
+    --bg: #fbfcfd; --surface: #ffffff; --line: #e4e7ec;
+    --ink: #14161c; --ink-2: #4a5060; --ink-3: #6b7283;
+    --accent: #c9820a; --accent-ink: #17110a; --accent-bg: #fdf0d2;
+    --brand: #1d5fd6; --track: #e4e7ec; --meter: #1d5fd6;
+    --good: #0d7a4c; --good-bg: #dff5e8; --bad: #b42a1e; --bad-bg: #fbe7e4; --fresh: #fdf3dc;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 18px; }
+  h1 { font-size: 20px; margin: 0; flex: 1 1 auto; letter-spacing: -0.01em; }
+  h1 small { font-size: 13px; font-weight: 400; color: var(--ink-3); margin-left: 8px; }
+  h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.06em; }
+  .live { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); border: 1px solid var(--line); border-radius: 20px; padding: 5px 11px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+  .live.down .dot { background: var(--bad); }
+  .live:not(.down) .dot { animation: pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity: 0.35; } }
+  button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); padding: 7px 13px; }
+  button:hover { border-color: var(--ink-3); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+  .tile .label { font-size: 12px; color: var(--ink-3); }
+  .tile .value { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .tile .note { font-size: 12px; color: var(--ink-2); margin-top: 2px; min-height: 17px; }
+  .tile .value.brand { color: var(--brand); }
+  /* A number that just changed pops briefly, so a sell is visible from the back of the room. */
+  .bump { animation: bump 1.4s ease-out; }
+  @keyframes bump { 0% { transform: scale(1.18); background: var(--fresh); } 100% { transform: scale(1); background: transparent; } }
+  .tile .value, td .qty { display: inline-block; transform-origin: left center; border-radius: 6px; }
+  @media (prefers-reduced-motion: reduce) { .bump, tr.fresh td, .live:not(.down) .dot { animation: none; } }
+
+  .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 2.1fr); gap: 16px; align-items: start; }
+  @media (max-width: 980px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .card + .card { margin-top: 16px; }
+  .card > .head { display: flex; justify-content: space-between; align-items: baseline; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+  .card > .head span { font-size: 12px; color: var(--ink-3); }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; font-weight: 500; color: var(--ink-3); padding: 9px 9px; white-space: nowrap; }
+  td { padding: 10px 9px; border-top: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+  th:first-child, td:first-child { padding-left: 16px; }
+  th:last-child, td:last-child { padding-right: 16px; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, Consolas, "SF Mono", monospace; font-size: 12.5px; }
+  .muted { color: var(--ink-3); }
+  .empty td { color: var(--ink-3); text-align: center; padding: 26px 16px; white-space: normal; }
+  tr.fresh td { animation: fresh 4s ease-out; }
+  @keyframes fresh { from { background: var(--fresh); } to { background: transparent; } }
+  .meter { height: 5px; border-radius: 3px; background: var(--track); margin-top: 5px; min-width: 64px; overflow: hidden; }
+  .meter i { display: block; height: 100%; border-radius: 3px; background: var(--meter); transition: width 0.6s; }
+  .chan { display: inline-block; border: 1px solid var(--line); border-radius: 6px; padding: 1px 7px; font-size: 12px; color: var(--ink-2); }
+  .chan.sms { border-color: var(--accent); background: var(--accent-bg); color: var(--ink); font-weight: 600; }
+  .status { display: inline-flex; align-items: center; gap: 5px; border-radius: 6px; padding: 1px 8px; font-size: 12px; color: var(--ink); }
+  .status.ok { background: var(--good-bg); } .status.ok b { color: var(--good); }
+  .status.no { background: var(--bad-bg); } .status.no b { color: var(--bad); }
+  td.reason { white-space: normal; min-width: 220px; }
+  td.packet { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+
+  #gate { max-width: 380px; margin: 14vh auto 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 24px; }
+  #gate p { color: var(--ink-2); margin: 6px 0 16px; }
+  #gate input { width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); margin-bottom: 12px; }
+  #gate .err { color: var(--bad); font-size: 13px; min-height: 19px; margin: 0 0 8px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<form id="gate" hidden>
+  <h1>TradeRescue Admin</h1>
+  <p>Enter the admin key to view live orders.</p>
+  <input id="key" type="password" autocomplete="current-password" placeholder="Admin key" aria-label="Admin key" required>
+  <p class="err" id="gateErr" role="alert"></p>
+  <button class="primary" type="submit">Open dashboard</button>
+</form>
+
+<main id="app" hidden>
+  <header>
+    <h1>TradeRescue Admin <small id="user"></small></h1>
+    <span class="live" id="live" role="status"><span class="dot"></span><span id="liveText">Connecting…</span></span>
+    <button id="reset" type="button">Reset demo</button>
+    <button id="signout" type="button">Lock</button>
+  </header>
+
+  <section class="tiles" aria-label="Summary">
+    <div class="tile"><div class="label">Portfolio value</div><div class="value brand" id="kValue">–</div><div class="note" id="kValueNote"></div></div>
+    <div class="tile"><div class="label">Orders filled</div><div class="value" id="kFilled">–</div><div class="note" id="kFilledNote"></div></div>
+    <div class="tile"><div class="label">Received by SMS</div><div class="value" id="kSms">–</div><div class="note">Arrived with no data connection</div></div>
+    <div class="tile"><div class="label">Rejected</div><div class="value" id="kRejected">–</div><div class="note">Forged, replayed or over limit</div></div>
+  </section>
+
+  <div class="grid">
+    <div>
+      <section class="card">
+        <div class="head"><h2>Holdings</h2><span>Live from Firestore</span></div>
+        <div class="scroll"><table>
+          <thead><tr><th>Stock</th><th>Shares left</th><th class="num">Price</th><th class="num">Value</th></tr></thead>
+          <tbody id="holdings"></tbody>
+        </table></div>
+      </section>
+    </div>
+    <div>
+      <section class="card">
+        <div class="head"><h2>Orders</h2><span>Newest first</span></div>
+        <div class="scroll"><table>
+          <thead><tr><th>Time</th><th>Status</th><th>Stock</th><th class="num">Qty</th><th class="num">Fill price</th><th class="num">Proceeds</th><th>Channel</th><th>From</th><th>Ref</th></tr></thead>
+          <tbody id="orders"></tbody>
+        </table></div>
+      </section>
+      <section class="card">
+        <div class="head"><h2>Rejected packets</h2><span>Stopped before anything was sold</span></div>
+        <div class="scroll"><table>
+          <thead><tr><th>Time</th><th>Status</th><th>Reason</th><th>Channel</th><th>From</th><th>Packet</th></tr></thead>
+          <tbody id="rejections"></tbody>
+        </table></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+(() => {
+  // Same origin through Firebase Hosting by default; ?api=<function URL>
+  // points the page at a function directly (e.g. when opened from disk).
+  const API = (new URLSearchParams(location.search).get("api") || "/api").replace(/\/+$/, "");
+  const POLL_MS = 2000;
+  const $ = (id) => document.getElementById(id);
+  const inr = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 });
+  const inr0 = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
+  const CHANNELS = { SMS: "SMS", DIRECT: "Internet", HTTP_FALLBACK: "HTTP fallback" };
+
+  const store = {
+    get() { try { return localStorage.getItem("adminKey") || ""; } catch { return ""; } },
+    set(v) { try { v ? localStorage.setItem("adminKey", v) : localStorage.removeItem("adminKey"); } catch {} },
+  };
+  let key = store.get();
+  // A bookmark like /#key=... opens straight into the dashboard. The
+  // fragment never reaches the server and is removed from the address bar.
+  const fromHash = new URLSearchParams(location.hash.slice(1)).get("key");
+  if (fromHash) {
+    key = fromHash;
+    store.set(key);
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  let timer = null;
+  let seen = null; // ids already drawn; null until the first load so nothing flashes on open
+
+  // All text goes in through textContent: packet contents come from SMS
+  // messages anyone can send, so none of it is ever treated as HTML.
+  function el(tag, props, ...children) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (k === "class") node.className = v; else if (k === "title") node.title = v; else node.setAttribute(k, v);
+    }
+    for (const c of children) node.append(c instanceof Node ? c : document.createTextNode(c == null ? "" : String(c)));
+    return node;
+  }
+  const time = (ms) => (ms ? new Date(ms).toLocaleTimeString("en-IN", { hour12: false }) : "–");
+  const status = (ok) => el("span", { class: "status " + (ok ? "ok" : "no") }, el("b", {}, ok ? "✓" : "✕"), ok ? "Filled" : "Rejected");
+  const channel = (c) => el("span", { class: "chan" + (c === "SMS" ? " sms" : "") }, CHANNELS[c] || c || "–");
+  const emptyRow = (cols, text) => el("tr", { class: "empty" }, el("td", { colspan: cols }, text));
+
+  function showGate(message) {
+    clearTimeout(timer);
+    $("app").hidden = true;
+    $("gate").hidden = false;
+    $("gateErr").textContent = message || "";
+    $("key").focus();
+  }
+
+  async function call(path, method) {
+    const res = await fetch(API + path, { method: method || "GET", headers: { "x-admin-key": key }, cache: "no-store" });
+    if (res.status === 401) throw Object.assign(new Error("unauthorized"), { unauthorized: true });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return res.json();
+  }
+
+  // Writes a number and, if it differs from what was on screen, flashes it.
+  // Nothing flashes on the first load (seen is still null then).
+  function setValue(node, text) {
+    text = String(text);
+    if (node.textContent === text) return;
+    const animate = seen !== null;
+    node.textContent = text;
+    if (!animate) return;
+    node.classList.remove("bump");
+    void node.offsetWidth; // restart the animation if it is already running
+    node.classList.add("bump");
+  }
+
+  function render(d) {
+    $("user").textContent = "User " + d.user_id;
+    const start = Object.fromEntries(d.starting_holdings.map((h) => [h.symbol, h]));
+    const value = d.holdings.reduce((s, h) => s + h.qty * h.price, 0);
+    const startValue = d.starting_holdings.reduce((s, h) => s + h.qty * h.price, 0);
+    const sold = startValue - value;
+    setValue($("kValue"), inr0.format(value));
+    $("kValueNote").textContent = sold > 0.005 ? inr0.format(sold) + " sold since reset" : "Nothing sold yet";
+    setValue($("kFilled"), d.totals.filled);
+    const latest = d.orders[0];
+    $("kFilledNote").textContent = latest ? "Latest at " + time(latest.at) : "Waiting for the first order";
+    setValue($("kSms"), d.totals.via_sms);
+    setValue($("kRejected"), d.totals.rejected);
+
+    // Holdings rows are updated in place (not rebuilt) so the bar slides
+    // and the share count flashes when a sell lands.
+    const body = $("holdings");
+    const rows = Object.fromEntries([...body.children].map((tr) => [tr.dataset.symbol, tr]));
+    if (d.holdings.length !== body.children.length || d.holdings.some((h) => !rows[h.symbol])) {
+      body.replaceChildren(...d.holdings.map((h) => {
+        const tr = el("tr", {},
+          el("td", {}, el("strong", {}, h.symbol)),
+          el("td", {}, el("span", { class: "qty" }), el("div", { class: "meter" }, el("i", {}))),
+          el("td", { class: "num price" }),
+          el("td", { class: "num value" }));
+        tr.dataset.symbol = h.symbol;
+        rows[h.symbol] = tr;
+        return tr;
+      }));
+    }
+    for (const h of d.holdings) {
+      const tr = rows[h.symbol];
+      const from = start[h.symbol] ? start[h.symbol].qty : h.qty;
+      const pct = from > 0 ? Math.max(0, Math.min(100, (h.qty / from) * 100)) : 0;
+      setValue(tr.querySelector(".qty"), h.qty + " of " + from);
+      tr.querySelector(".meter").title = Math.round(pct) + "% remaining";
+      tr.querySelector(".meter i").style.width = pct + "%";
+      tr.querySelector(".price").textContent = inr.format(h.price);
+      tr.querySelector(".value").textContent = inr.format(h.qty * h.price);
+    }
+
+    const isNew = (id) => seen !== null && !seen.has(id);
+    $("orders").replaceChildren(...(d.orders.length ? d.orders.map((o) =>
+      el("tr", isNew(o.tx_id) ? { class: "fresh" } : {},
+        el("td", { class: "muted" }, time(o.at)),
+        el("td", {}, status(true)),
+        el("td", {}, el("strong", {}, o.symbol)),
+        el("td", { class: "num" }, o.quantity),
+        el("td", { class: "num" }, inr.format(o.fill_price)),
+        el("td", { class: "num" }, inr.format(o.proceeds)),
+        el("td", {}, channel(o.channel)),
+        el("td", { class: "mono muted" }, o.from || "–"),
+        el("td", { class: "mono" }, o.tx_id))
+    ) : [emptyRow(9, "No orders yet. Send an emergency sell from the phone and it appears here.")]));
+
+    $("rejections").replaceChildren(...(d.rejections.length ? d.rejections.map((r) =>
+      el("tr", isNew(r.id) ? { class: "fresh" } : {},
+        el("td", { class: "muted" }, time(r.at)),
+        el("td", {}, status(false)),
+        el("td", { class: "reason" }, r.reason),
+        el("td", {}, channel(r.channel)),
+        el("td", { class: "mono muted" }, r.from || "–"),
+        el("td", { class: "mono muted packet", title: r.packet || "" }, r.packet || "–"))
+    ) : [emptyRow(6, "Nothing rejected.")]));
+
+    seen = new Set([...d.orders.map((o) => o.tx_id), ...d.rejections.map((r) => r.id)]);
+    $("live").classList.remove("down");
+    $("liveText").textContent = "Live · updated " + time(Date.now());
+  }
+
+  async function tick() {
+    clearTimeout(timer);
+    try {
+      render(await call("/admin/overview"));
+      $("gate").hidden = true;
+      $("app").hidden = false;
+    } catch (e) {
+      if (e.unauthorized) { store.set(""); key = ""; showGate(seen === null && $("gate").hidden === false ? "That key was not accepted." : ""); return; }
+      $("live").classList.add("down");
+      $("liveText").textContent = "Disconnected — retrying";
+      if ($("app").hidden) { $("gate").hidden = true; $("app").hidden = false; }
+    }
+    timer = setTimeout(tick, POLL_MS);
+  }
+
+  $("gate").addEventListener("submit", (e) => {
+    e.preventDefault();
+    key = $("key").value.trim();
+    store.set(key);
+    $("gateErr").textContent = "";
+    tick();
+  });
+  $("signout").addEventListener("click", () => { store.set(""); key = ""; seen = null; $("key").value = ""; showGate(""); });
+  $("reset").addEventListener("click", async () => {
+    if (!confirm("Reset the demo? This restores the starting portfolio and deletes all orders and rejected packets.")) return;
+    try { seen = null; render(await call("/demo/reset", "POST")); } catch { alert("Reset failed. Check the connection and try again."); }
+  });
+  // No point polling a tab nobody is looking at.
+  document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(timer); else if (key) tick(); });
+
+  if (key) tick(); else showGate("");
+})();
+</script>
+</body>
+</html>
