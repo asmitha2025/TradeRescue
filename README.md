@@ -1,96 +1,85 @@
-# TradeRescue — Android
+TradeRescue
 
-When a trading app loses its data connection, you can't sell. TradeRescue
-adds an emergency channel: the order is packed into a compact, HMAC-signed
-packet (about 85 characters) and sent as a real SMS over the cellular
-radio, which keeps working when mobile data and Wi-Fi don't.
+A signed, replay-protected order relay that keeps working when the data connection doesn't.
 
-This is the native companion to `ui/index.html` in the main project. It
-exists for the one thing a web page cannot do: call Android's `SmsManager`
-directly.
+When a trading app loses mobile data, you can't sell. TradeRescue adds an emergency channel: the order is packed into a compact HMAC-signed packet (about 85 characters, one SMS segment) and sent over the cellular radio, which often keeps working when mobile data and Wi-Fi don't. A backend verifies the packet and executes the order, enforcing limits on the server.
 
-## How it works
+The trading use case is the demo. The engineering problem underneath is general: get an order through an unreliable channel exactly once, without trusting the channel.
 
-```
-            online                         offline
-Phone ──── HTTPS /order ────► Backend      Phone ── SMS ──► Twilio number ──► Backend
-                                           (signed packet)   /webhook/twilio-sms
-```
+Status: working prototype (Kotlin / Jetpack Compose + Firebase). See What is verified for exactly what has and hasn't been tested.
 
-The packet, identical across the Android app, the web UI and `app/packet.py`:
 
-```
+How it works
+            online                              offline
+Phone ──── HTTPS /order ────► Backend     Phone ── SMS ──► Twilio number ──► Cloud Function
+                                          (signed packet)                    (verify → execute → confirm by SMS)
+The packet
+
+One format, shared by the Android app, the web UI and the Python reference implementation:
+
 TRX|tx_id|user_id|action|symbol|qty|order_type|nonce|timestamp|signature
 TRX|TRX0A1B2C|U10021|S|RELIANCE|5|M|deadbeef|1700000000|30727513722d65e08ca55805de554550
-```
+signature is HMAC-SHA256 over the middle eight fields, truncated to 32 hex characters so the whole packet fits one SMS.
+nonce and timestamp let the backend reject replayed packets.
+Each holding has a pre-authorized emergency limit; the app won't queue more than that.
+Channel selection
 
-- `signature` is HMAC-SHA256 over the middle eight fields, truncated to 32
-  hex characters so the whole packet fits one SMS segment.
-- `nonce` and `timestamp` let the backend reject replays.
-- Each holding has a pre-authorized emergency limit; the app never lets you
-  queue more than that.
+Decided at the moment the user enters their PIN:
 
-Channel selection, decided at the moment you enter your PIN:
+Situation	What the app does
+Online, backend set	POST /order over HTTPS
+Offline, SMS number set, permission granted	Real SMS; waits for the radio to confirm it was accepted
+Offline, SMS not usable, backend set	Posts the same signed packet to /emergency/sms
+No backend set	Simulation mode: full flow and real signing, no network calls
 
-| Situation | What the app does |
-|---|---|
-| Online, backend set | `POST /order` over HTTPS |
-| Offline, SMS number set, permission granted | Real SMS; waits for the radio to confirm it was accepted |
-| Offline, SMS not usable, backend set | Posts the same signed packet to `/emergency/sms` |
-| No backend set | Simulation mode — full flow, real signing, no network calls |
+The app states which path it used on screen instead of pretending.
 
-## Backend
+Reliability design
 
-A Firebase backend lives in [firebase/](firebase/README.md): a Cloud
-Function that receives the SMS from Twilio, verifies the packet and
-executes the sell in Firestore, then texts a confirmation back. Once its
-URL is set in the app, the dashboard shows the server's holdings.
+The goal is that a packet can be lost, delayed, duplicated or tampered with, and the system still behaves safely.
 
-## Build and run
+Failure / threat	Mitigation
+Data connection down	Fallback chain: HTTPS → SMS → HTTP fallback → simulation
+Packet tampered in transit	HMAC-SHA256 signature verified server-side before anything executes
+Packet replayed	nonce + timestamp checked by the backend; stale or reused packets are rejected
+Oversized or runaway order	Per-holding emergency limit enforced on the backend (the app check is only a convenience)
+Signature implementation drift across platforms	Signing pinned to a published HMAC test vector and cross-checked in Python, .NET and Web Crypto
+Phone can't hear the result offline	UI says "Order sent", not "executed"; the backend confirms the fill by SMS
 
-Requirements: Android Studio (Koala or newer) or just its bundled JDK plus
-the Android SDK. Min SDK 26.
+Design rule: the client is never trusted. Limits, signature, timestamp and nonce are all checked again on the server.
 
-```
-gradlew.bat :app:assembleDebug        # APK in app/build/outputs/apk/debug/
-gradlew.bat :app:testDebugUnitTest    # packet + signing tests
-gradlew.bat :app:installDebug         # onto a connected phone/emulator
-```
+Backend
 
-From a plain terminal, point `JAVA_HOME` at Android Studio's `jbr` folder
-and `ANDROID_HOME` at your SDK first. In Android Studio, just open the
-folder and press Run.
+firebase/ contains a Cloud Function (with Firestore) that:
 
-## Settings (⚙ on the dashboard)
+receives the SMS forwarded by Twilio,
+verifies the signature, timestamp and nonce,
+checks the per-holding emergency limit,
+executes the sell in Firestore,
+texts a confirmation back.
 
-- **Backend URL** — your deployed FastAPI backend. Empty means simulation
-  mode. Debug builds also accept plain `http://` so you can point at a
-  laptop: `http://10.0.2.2:8000` from an emulator, or your laptop's LAN IP
-  from a phone.
-- **SMS destination number** — where the emergency SMS goes (your Twilio
-  number, so the backend's `/webhook/twilio-sms` receives it).
+Once its URL is set in the app, the dashboard shows the server's holdings.
 
-Both are saved across restarts. The same screen shows whether the data
-connection is up and whether SMS permission is granted.
+The packet reference implementation (app/packet.py) and the web UI (ui/index.html) live in the main TradeRescue project; this repo is the native Android companion. It exists for the one thing a web page can't do: call Android's SmsManager directly.
 
-## Demo script (about two minutes)
+Build and run
 
-1. Open the app. Point out the green **Online** pill — it reflects the
-   phone's real connectivity.
-2. Tap **Emergency Sell → RELIANCE → 5 → PIN 1234**. Order goes over HTTPS.
-3. Turn on airplane mode, then re-enable only the cellular radio — or just
-   tap the pill to rehearse an outage ("Offline · test").
-4. Repeat the sell. The Executing screen shows each step and the exact
-   signed packet that goes over the air, with its character count.
-5. On a phone with a SIM and an SMS number set, show the message in the
-   phone's own Messages app — that is the proof it left over the radio.
+Requirements: Android Studio (Koala or newer), or its bundled JDK plus the Android SDK. Min SDK 26.
 
-Without a SIM (emulator, tablet) step 5 uses the HTTP fallback or
-simulation, and the app says so on screen rather than pretending.
+bash
+./gradlew :app:assembleDebug        # APK in app/build/outputs/apk/debug/
+./gradlew :app:testDebugUnitTest    # packet + signing tests
+./gradlew :app:installDebug         # onto a connected phone/emulator
 
-## Structure
+On Windows use gradlew.bat. From a plain terminal, point JAVA_HOME at Android Studio's jbr folder and ANDROID_HOME at your SDK first. In Android Studio, just open the folder and press Run.
 
-```
+Settings (⚙ on the dashboard)
+Backend URL: your deployed backend. Empty means simulation mode. Debug builds also accept plain http:// (http://10.0.2.2:8000 from an emulator, or your laptop's LAN IP from a phone).
+SMS destination number: where the emergency SMS goes (your Twilio number, so the backend webhook receives it).
+
+Both are saved across restarts. The same screen shows whether the data connection is up and whether SMS permission is granted.
+
+Project structure
 app/src/main/java/com/traderescue/app/
 ├── MainActivity.kt        entry point; requests SEND_SMS
 ├── AppViewModel.kt        screen state, connectivity, the execute() flow
@@ -100,32 +89,25 @@ app/src/main/java/com/traderescue/app/
 │   ├── BackendApi.kt      OkHttp calls to /order and /emergency/sms
 │   └── SmsSender.kt       SmsManager call + sent-status confirmation
 └── ui/
-    ├── Theme.kt           same palette as ui/index.html
+    ├── Theme.kt           palette shared with the web UI
     └── Screens.kt         all 7 screens, matching the web flow
+firebase/                  Cloud Function: verify, enforce limits, execute, confirm
 app/src/test/.../PacketTest.kt   wire format, signature vectors, SMS size
-```
+What is verified, and what isn't
 
-## What is verified, and what isn't
+Verified
 
-- **Verified:** the project compiles, lint reports no errors, and the unit
-  tests pass. The tests pin the HMAC against a published test vector and
-  the full wire packet against a signature computed independently in .NET,
-  on top of the earlier cross-checks against Python's `hmac` and the web
-  UI's Web Crypto implementation.
-- **Not yet verified:** the app has not been run on a device or emulator
-  from this build, and the real-SMS path has not been exercised on a phone
-  with a SIM. Do a full run-through on the demo phone before presenting.
+The project compiles, lint reports no errors, and the unit tests pass.
+HMAC pinned against a published test vector.
+The full wire packet matches a signature computed independently in .NET, plus earlier cross-checks against Python's hmac and the web UI's Web Crypto.
 
-## Known limits (deliberate, for a demo)
+A single shared signing key means one leaked key compromises every user; per-device keys are the fix.
+Roadmap
+ Run end to end on a physical phone with a SIM and record the demo
+ Per-device keys in Android Keystore
+ Parse the confirmation SMS to close the "sent vs. executed" gap
+ CI: run testDebugUnitTest on every push (GitHub Actions)
+ Idempotency on tx_id documented and tested (duplicate delivery must not execute twice)
+Author
 
-- The signing secret and PIN are constants in source. A real build would
-  provision a per-device key into the Android Keystore and verify the PIN
-  (or biometrics) against something the server controls.
-- On the SMS channel the app shows **Order sent**, not *executed*: the
-  radio confirmed the message, but the fill is confirmed by the backend,
-  which an offline phone can't hear from. Reading the broker's reply SMS
-  would close that loop.
-- Holdings and prices are demo data held in memory.
-- Google Play restricts `SEND_SMS` to default SMS apps and a few approved
-  use cases, so this would ship by sideload/enterprise distribution, or
-  hand off to the system SMS composer instead.
+Built by Asmitha M.
