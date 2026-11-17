@@ -69,20 +69,11 @@ jobs:
       - name: Install the Firebase CLI
         run: npm install --global firebase-tools@15
 
-      # Run from firebase/functions, not firebase/, so the working
-      # directory IS the package root that owns node_modules. Node resolves
-      # a bare specifier from the requiring file upward, so cwd should not
-      # matter -- but this removes the question entirely, and NODE_PATH
-      # below removes it again for whatever process the CLI spawns.
-      # --config points back at the firebase.json one level up.
       - name: Firestore emulator smoke test
-        working-directory: firebase/functions
-        env:
-          NODE_PATH: ${{ github.workspace }}/firebase/functions/node_modules
+        working-directory: firebase
         run: >
           firebase emulators:exec --only firestore --project traderescue-emulator
-          --config ../firebase.json
-          "node emulator-test/firestore.smoke.js"
+          "node functions/emulator-test/firestore.smoke.js"
 
       # Printed only when the step above fails, so a module-resolution
       # problem is diagnosed in the same run instead of the next one.
