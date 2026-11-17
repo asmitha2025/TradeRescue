@@ -21,6 +21,8 @@
 
 // "nonces" held the v1 replay guard. tx_id replaced it, but the name stays
 // in the sweep so a deployment carrying old docs gets cleaned on reset.
+// The audit log is deliberately NOT swept by a demo reset: a record of
+// who enrolled or revoked what should outlive a "start again" button.
 const HISTORY_COLLECTIONS = ["orders", "rejections", "nonces"];
 
 const millis = (ts) => (ts && ts.toMillis ? ts.toMillis() : null);
@@ -182,6 +184,47 @@ class FirestoreStore {
       await this.db.recursiveDelete(this.db.collection(name));
     }
   }
+
+  async putEnrollmentCode(record) {
+    await this.db.collection("enrollment_codes").doc(record.codeHash).set({
+      ...record, usedAt: null, createdAt: this.stamp,
+    });
+  }
+
+  /**
+   * Spends a code, atomically.
+   *
+   * Single use is the whole point, so the read and the mark cannot be two
+   * steps: two devices presenting the same code at the same moment must
+   * not both succeed. Returns the record on success and null on anything
+   * else, with the caller left to decide what to say -- it deliberately
+   * does not distinguish "never existed" from "already spent", because the
+   * caller should not leak that difference either.
+   */
+  async consumeEnrollmentCode(codeHash, now) {
+    const ref = this.db.collection("enrollment_codes").doc(codeHash);
+    return this.db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      if (!snap.exists) return null;
+      const record = snap.data();
+      if (record.usedAt) return null;
+      if (now > record.expiresAt) return null;
+      t.update(ref, { usedAt: now });
+      return { ...record, usedAt: now };
+    });
+  }
+
+  async addAuditEvent(record) {
+    await this.db.collection("audit").add({ ...record, createdAt: this.stamp });
+  }
+
+  async listAuditEvents(limit) {
+    const snap = await this.db.collection("audit").orderBy("createdAt", "desc").limit(limit).get();
+    return snap.docs.map((d) => {
+      const e = d.data();
+      return { id: d.id, ...e, at: millis(e.createdAt) };
+    });
+  }
 }
 
 /**
@@ -198,6 +241,8 @@ class MemoryStore {
     this.users = new Map();
     this.orders = new Map();
     this.rejections = [];
+    this.enrollmentCodes = new Map();
+    this.audit = [];
     this.tail = Promise.resolve();
     this.seq = 0;
   }
@@ -266,6 +311,32 @@ class MemoryStore {
   async clearHistory() {
     this.orders.clear();
     this.rejections = [];
+  }
+
+  async putEnrollmentCode(record) {
+    this.enrollmentCodes.set(record.codeHash, { ...record, usedAt: null, createdAt: this.stamp });
+  }
+
+  /**
+   * Single use, and atomic because the body is synchronous: nothing can
+   * interleave between the check and the mark.
+   */
+  async consumeEnrollmentCode(codeHash, now) {
+    const record = this.enrollmentCodes.get(codeHash);
+    if (!record) return null;
+    if (record.usedAt) return null;
+    if (now > record.expiresAt) return null;
+    const spent = { ...record, usedAt: now };
+    this.enrollmentCodes.set(codeHash, spent);
+    return spent;
+  }
+
+  async addAuditEvent(record) {
+    this.audit.push({ id: `evt_${this.audit.length + 1}`, ...record, createdAt: this.stamp });
+  }
+
+  async listAuditEvents(limit) {
+    return recent(this.audit, limit);
   }
 }
 

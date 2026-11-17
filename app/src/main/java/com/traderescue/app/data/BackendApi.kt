@@ -21,19 +21,20 @@ class BackendApi(baseUrl: String) {
     data class Enrollment(val keyId: String, val userId: String, val secretHex: String)
 
     /**
-     * Enrolls this device and receives its secret. Online only, and the one
-     * moment that secret crosses the wire.
+     * Enrolls this device and receives its secret. Online only, over
+     * HTTPS, and the one moment that secret crosses the wire.
      *
-     * The enrollment token is this demo's stand-in for the authenticated
-     * session a real deployment would require. It is not authentication:
-     * anyone holding it can enroll a device for any user. The README says
-     * so, and Phase 4's login is what replaces it.
+     * Needs both a signed-in session and a one-time code. The session says
+     * who is asking; the code says this particular device was authorised
+     * by a human looking at an already signed-in screen. A leaked session
+     * alone cannot silently add a device, and a code alone is useless to
+     * anyone not signed in.
      */
-    suspend fun enrollDevice(userId: String): Result<Enrollment> {
-        val body = JSONObject().apply { put("user_id", userId) }
+    suspend fun enrollDevice(sessionToken: String, code: String): Result<Enrollment> {
+        val body = JSONObject().apply { put("code", code) }
             .toString().toRequestBody("application/json".toMediaType())
         return execute("$base/enroll") {
-            post(body).header("x-enroll-token", ENROLL_TOKEN)
+            post(body).header("Authorization", "Bearer $sessionToken")
         }.mapCatching {
             Enrollment(
                 keyId = it.getString("key_id"),
@@ -125,10 +126,6 @@ class BackendApi(baseUrl: String) {
     }
 
     private companion object {
-        // Matches ENROLL_TOKEN on the backend, which defaults to this. A
-        // constant in source, exactly like DEMO_PIN, and no more secure.
-        const val ENROLL_TOKEN = "demo-enroll"
-
         // One shared client (connection pool + threads) for the whole app.
         // The read timeout is generous because free-tier hosts cold-start.
         val client: OkHttpClient = OkHttpClient.Builder()

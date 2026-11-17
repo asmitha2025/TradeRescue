@@ -24,6 +24,25 @@ const ORDER_TYPE_IOC = "I";
 const KEY_ROTATION_GRACE_SECONDS = MAX_VALIDITY_SECONDS;
 
 /**
+ * How long an enrollment code is good for.
+ *
+ * Short, because the code is read off one screen and typed into another
+ * and that takes a minute, not an afternoon. A code is also single use, so
+ * the window only has to cover one honest attempt.
+ */
+const ENROLLMENT_CODE_TTL_SECONDS = 10 * 60;
+
+/**
+ * How many devices one trading account may have signing at once.
+ *
+ * Every active device is another key the server holds and another phone
+ * that can sell. Three covers a phone, a spare and a tablet; past that the
+ * user has to retire one deliberately, which is the moment they would
+ * notice a device they do not recognise.
+ */
+const MAX_ACTIVE_DEVICES = 3;
+
+/**
  * Failures that stop a packet before it becomes an order.
  *
  * None of these may claim a tx_id or leave a ledger record, so an attacker
@@ -69,11 +88,69 @@ class TradeRescue {
    * `now` returns epoch seconds and defaults to the real clock, so a test
    * can push a packet past its expiry without waiting for it.
    */
-  constructor({ store, keyStore, now = () => Math.floor(Date.now() / 1000), log = null }) {
+  constructor({ store, keyStore, sessionAuth, now = () => Math.floor(Date.now() / 1000), log = null }) {
     this.store = store;
     this.keyStore = keyStore;
+    this.sessionAuth = sessionAuth;
     this.now = now;
     this.log = log;
+  }
+
+  /**
+   * Resolves the signed-in session behind a key-lifecycle request.
+   *
+   * Enrollment, revocation and rotation all go through here. None of them
+   * has an offline path and none of them may happen on the strength of a
+   * shared constant: each hands out or retires a key that can sell shares.
+   */
+  async requireSession(idToken) {
+    if (!this.sessionAuth) {
+      // A service wired without an authenticator must refuse rather than
+      // wave everything through. Failing closed is the only safe default
+      // for the one operation that creates signing keys.
+      throw new OrderError(500, "No authentication is configured", "NO_AUTH_CONFIGURED");
+    }
+    return this.sessionAuth.verify(idToken);
+  }
+
+  /** Codes are credentials, so only their hash is ever stored. */
+  hashCode(code) {
+    return crypto.createHash("sha256").update(String(code), "utf8").digest("hex");
+  }
+
+  /**
+   * Issues a one-time enrollment code to an already signed-in session.
+   *
+   * The code is shown on a screen the user is already signed in to and
+   * typed into the device being enrolled. That is what ties a new key to a
+   * deliberate human act rather than to possession of a token.
+   */
+  async createEnrollmentCode(idToken) {
+    const session = await this.requireSession(idToken);
+    // Six digits, from a CSPRNG. Short enough to read aloud, and single
+    // use with a ten-minute life, so the search space does not have to
+    // stand up to an offline attack -- only to one typed guess.
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, "0");
+    const expiresAt = this.now() + ENROLLMENT_CODE_TTL_SECONDS;
+    await this.store.putEnrollmentCode({
+      codeHash: this.hashCode(code),
+      uid: session.uid,
+      userId: session.userId,
+      expiresAt,
+    });
+    await this.audit("ENROLLMENT_CODE_ISSUED", session, { expiresAt });
+    return { code, user_id: session.userId, expires_at: expiresAt, valid_for_seconds: ENROLLMENT_CODE_TTL_SECONDS };
+  }
+
+  /** One line per key-lifecycle event, whether or not it succeeded. */
+  async audit(type, session, extra = {}) {
+    await this.store.addAuditEvent({
+      type,
+      uid: session ? session.uid : null,
+      userId: session ? session.userId : null,
+      at: this.now(),
+      ...extra,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -88,26 +165,86 @@ class TradeRescue {
    * before calling here -- index.js does that, and the README is explicit
    * that the demo's stand-in for a real authenticated session is not one.
    */
-  async enrollDevice(userId) {
-    if (!/^[A-Za-z0-9]{1,12}$/.test(String(userId || ""))) {
-      throw new OrderError(400, "A device enrolls for one user id", "BAD_USER");
+  async enrollDevice(idToken, code) {
+    const session = await this.requireSession(idToken);
+
+    // The session says who is asking. The code says this particular
+    // device was authorised by a human looking at a signed-in screen.
+    // Both are required: a leaked session alone cannot silently add a
+    // device, and a code alone is useless to anyone not signed in.
+    const spent = await this.store.consumeEnrollmentCode(this.hashCode(code), this.now());
+    if (!spent) {
+      await this.audit("ENROLLMENT_REFUSED", session, { reason: "BAD_CODE" });
+      // Deliberately one message for never-existed, already-used and
+      // expired. Telling them apart would tell an attacker which guesses
+      // were close.
+      throw new OrderError(401, "That enrollment code is not usable", "BAD_ENROLLMENT_CODE");
     }
-    const device = newDevice(userId, this.now());
+    if (spent.userId !== session.userId) {
+      await this.audit("ENROLLMENT_REFUSED", session, { reason: "CODE_FOR_ANOTHER_USER" });
+      throw new OrderError(403, "That enrollment code belongs to another account", "CODE_USER_MISMATCH");
+    }
+
+    const active = (await this.keyStore.listForUser(session.userId)).filter((d) => d.status === "active");
+    if (active.length >= MAX_ACTIVE_DEVICES) {
+      await this.audit("ENROLLMENT_REFUSED", session, { reason: "DEVICE_LIMIT", active: active.length });
+      throw new OrderError(
+        409,
+        `This account already has ${active.length} active devices. Revoke one before enrolling another.`,
+        "DEVICE_LIMIT",
+      );
+    }
+
+    const device = newDevice(session.userId, this.now());
     await this.keyStore.put(device);
+    await this.audit("DEVICE_ENROLLED", session, { keyId: device.keyId });
     return {
       key_id: device.keyId,
       user_id: device.userId,
       // Hex, because the phone imports these bytes into its Keystore.
       device_secret: device.secret.toString("hex"),
       enrolled_at: device.createdAt,
+      active_devices: active.length + 1,
+      device_limit: MAX_ACTIVE_DEVICES,
+    };
+  }
+
+  /** A device may only be acted on by the account that owns it. */
+  async requireOwnedDevice(session, keyId) {
+    const device = await this.keyStore.get(keyId);
+    if (!device) throw new OrderError(404, "Unknown key id", "UNKNOWN_KEY");
+    if (device.userId !== session.userId) {
+      await this.audit("KEY_ACTION_REFUSED", session, { keyId, reason: "NOT_YOURS" });
+      // Same answer as an unknown key: whether a key id exists on someone
+      // else's account is not this caller's business.
+      throw new OrderError(404, "Unknown key id", "UNKNOWN_KEY");
+    }
+    return device;
+  }
+
+  /** The devices this account has, without a byte of key material. */
+  async listDevices(idToken) {
+    const session = await this.requireSession(idToken);
+    const devices = await this.keyStore.listForUser(session.userId);
+    return {
+      user_id: session.userId,
+      device_limit: MAX_ACTIVE_DEVICES,
+      devices: devices.map((d) => ({
+        key_id: d.keyId,
+        status: d.status,
+        enrolled_at: d.createdAt,
+        rotated_at: d.rotatedAt || null,
+        replaced_by: d.replacedBy || null,
+      })),
     };
   }
 
   /** A revoked key is dead immediately: no grace, by design. */
-  async revokeDevice(keyId) {
-    const device = await this.keyStore.get(keyId);
-    if (!device) throw new OrderError(404, "Unknown key id", "UNKNOWN_KEY");
+  async revokeDevice(idToken, keyId) {
+    const session = await this.requireSession(idToken);
+    await this.requireOwnedDevice(session, keyId);
     await this.keyStore.setStatus(keyId, { status: "revoked", revokedAt: this.now() });
+    await this.audit("DEVICE_REVOKED", session, { keyId });
     return { key_id: keyId, status: "revoked", at: this.now() };
   }
 
@@ -116,9 +253,9 @@ class TradeRescue {
    * period. Unlike revocation, this assumes the old key was not compromised
    * -- only superseded.
    */
-  async rotateDevice(keyId) {
-    const device = await this.keyStore.get(keyId);
-    if (!device) throw new OrderError(404, "Unknown key id", "UNKNOWN_KEY");
+  async rotateDevice(idToken, keyId) {
+    const session = await this.requireSession(idToken);
+    const device = await this.requireOwnedDevice(session, keyId);
     if (device.status === "revoked") {
       throw new OrderError(409, "A revoked key cannot be rotated, enroll again", "REVOKED_KEY");
     }
@@ -127,6 +264,7 @@ class TradeRescue {
     await this.keyStore.setStatus(keyId, {
       status: "rotated", rotatedAt: this.now(), replacedBy: next.keyId,
     });
+    await this.audit("DEVICE_ROTATED", session, { keyId, replacedBy: next.keyId });
     return {
       key_id: next.keyId,
       user_id: next.userId,
@@ -495,4 +633,7 @@ class TradeRescue {
 /** "+919876543210" -> "+91•••••••210": enough to recognise, not enough to dial. */
 const maskNumber = (n) => (n ? n.slice(0, 3) + "•".repeat(Math.max(n.length - 6, 0)) + n.slice(-3) : null);
 
-module.exports = { TradeRescue, ORDER_TYPE_IOC, KEY_ROTATION_GRACE_SECONDS, PRE_LEDGER_CODES };
+module.exports = {
+  TradeRescue, ORDER_TYPE_IOC, KEY_ROTATION_GRACE_SECONDS, PRE_LEDGER_CODES,
+  ENROLLMENT_CODE_TTL_SECONDS, MAX_ACTIVE_DEVICES,
+};

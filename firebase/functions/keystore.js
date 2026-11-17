@@ -133,10 +133,35 @@ class SecretManagerKeyStore {
     return this.get(keyId);
   }
 
-  async listForUser() {
-    // Listing by label needs a filtered list call; not implemented because
-    // nothing here uses it and an untested guess is worse than an honest gap.
-    throw new Error("listForUser is not implemented for SecretManagerKeyStore");
+  /**
+   * The devices a user has, by label filter.
+   *
+   * The per-user device limit depends on this, so leaving it throwing
+   * would have made enrollment fail outright on this adapter -- which is
+   * worse than untested, it is known-broken. Written, and like the rest of
+   * this class never run against the real API.
+   *
+   * Secrets are listed, not accessed: this returns metadata only and never
+   * fetches a payload, so counting a user's devices does not pull their
+   * key material into memory.
+   */
+  async listForUser(userId) {
+    const [secrets] = await this.client.listSecrets({
+      parent: `projects/${this.projectId}`,
+      filter: `labels.user_id=${userId}`,
+    });
+    return (secrets || []).map((secret) => {
+      const labels = secret.labels || {};
+      const name = String(secret.name || "");
+      return {
+        keyId: name.slice(name.lastIndexOf("/") + 1).replace(/^traderescue-device-/, ""),
+        userId: labels.user_id,
+        status: labels.status || "active",
+        rotatedAt: labels.rotated_at ? Number(labels.rotated_at) : null,
+        replacedBy: labels.replaced_by || null,
+        createdAt: labels.created_at ? Number(labels.created_at) : null,
+      };
+    });
   }
 }
 

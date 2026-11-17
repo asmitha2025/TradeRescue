@@ -131,6 +131,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var wirePacket by mutableStateOf<String?>(null)
         private set
     var saleResult by mutableStateOf<SaleResult?>(null)
+        private set
 
     /** The order waiting for a signed confirmation, if any. */
     var pendingTxId by mutableStateOf<String?>(null)
@@ -138,7 +139,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** What the Settings screen says about this device's enrollment. */
     var enrollmentStatus by mutableStateOf("")
-        private set
+
+    /**
+     * The signed-in session and the one-time code, both typed in.
+     *
+     * Deliberately not persisted. The session token is a credential and
+     * the code is single use; keeping either across restarts would be
+     * storing something that should be used once and forgotten.
+     */
+    var sessionToken by mutableStateOf("")
+    var enrollmentCode by mutableStateOf("")
 
     /** Null until a sync is attempted; then whether the dashboard shows the server's numbers. */
     var syncError by mutableStateOf<String?>(null)
@@ -484,6 +494,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Enrolls this device, online, and keeps the secret only long enough to
      * derive the two sub-keys.
+     *
+     * Both inputs come from a session the user is already signed in to
+     * somewhere else: the session token identifies the account, the
+     * six-digit code proves this device was authorised deliberately.
+     *
+     * Note what is NOT here: a sign-in screen. Wiring the Firebase Auth
+     * SDK into the app needs a configured project and a google-services
+     * file this repo does not carry, so the two values are pasted in. The
+     * protocol the backend enforces is the real one; the way the app
+     * obtains these two strings is the part still to build.
      */
     fun enrollDevice() {
         val backend = backendUrl.trimEnd('/')
@@ -491,13 +511,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             enrollmentStatus = "Set a backend URL first — enrollment needs the network."
             return
         }
+        if (sessionToken.isBlank()) {
+            enrollmentStatus = "Sign in first: paste the session token from the signed-in screen."
+            return
+        }
+        if (enrollmentCode.isBlank()) {
+            enrollmentStatus = "Enter the six-digit code shown on the signed-in screen."
+            return
+        }
         enrollmentStatus = "Enrolling…"
         viewModelScope.launch {
-            BackendApi(backend).enrollDevice(USER_ID)
+            BackendApi(backend).enrollDevice(sessionToken.trim(), enrollmentCode.trim())
                 .onSuccess { enrolled ->
                     runCatching {
                         deviceKeys.enroll(enrolled.keyId, enrolled.userId, enrolled.secretHex)
                     }.onSuccess {
+                        // The code is single use and now spent; holding on
+                        // to it would only invite a confusing retry.
+                        enrollmentCode = ""
                         enrollmentStatus = "Enrolled as ${enrolled.keyId}"
                     }.onFailure {
                         enrollmentStatus = "Could not store the key on this device: ${it.message}"

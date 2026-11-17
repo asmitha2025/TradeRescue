@@ -555,9 +555,28 @@ private fun DeviceEnrollmentCard(vm: AppViewModel) {
                 modifier = Modifier.padding(top = 6.dp),
             )
         }
+        // Two credentials, neither of which this app can obtain on its own
+        // yet: the session token comes from a screen the user is already
+        // signed in to, and the code is shown there and lives ten minutes.
+        OutlinedTextField(
+            value = vm.sessionToken, onValueChange = { vm.sessionToken = it },
+            label = { Text("Session token") },
+            placeholder = { Text("paste from the signed-in screen") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+        )
+        OutlinedTextField(
+            value = vm.enrollmentCode, onValueChange = { vm.enrollmentCode = it.filter(Char::isDigit).take(6) },
+            label = { Text("Enrollment code") },
+            placeholder = { Text("6 digits, valid 10 minutes") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        )
         OutlinedButton(
             onClick = { vm.enrollDevice() },
-            enabled = vm.isOnline && vm.backendUrl.isNotEmpty(),
+            enabled = vm.isOnline && vm.backendUrl.isNotEmpty() &&
+                vm.sessionToken.isNotBlank() && vm.enrollmentCode.length == 6,
             modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
         ) {
             Text(if (keyId != null) "Re-enroll this device" else "Enroll this device")

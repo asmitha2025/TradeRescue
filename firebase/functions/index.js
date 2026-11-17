@@ -7,7 +7,9 @@ const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
 const { OrderError } = require("./packet");
 const { FirestoreStore } = require("./store");
+const { getAuth } = require("firebase-admin/auth");
 const { SecretManagerKeyStore, MemoryKeyStore } = require("./keystore");
+const { FirebaseSessionAuth } = require("./auth");
 const { TradeRescue } = require("./service");
 
 initializeApp();
@@ -40,11 +42,17 @@ function buildKeyStore() {
 const app = new TradeRescue({
   store: new FirestoreStore(db, FieldValue),
   keyStore: buildKeyStore(),
+  // Enrollment, revocation and rotation all require a signed-in session.
+  // There is no shared enrollment token any more, and no way to configure
+  // one back in: a service built without an authenticator refuses every
+  // key-lifecycle request rather than waving them through.
+  sessionAuth: new FirebaseSessionAuth(getAuth()),
   log: logger,
 });
 
 /**
- * Enrollment hands over a device secret, so it only happens over HTTPS.
+ * Key-lifecycle requests carry a session token and may hand back a device
+ * secret, so they only happen over HTTPS.
  *
  * Cloud Functions terminate TLS upstream, so the check is on the forwarded
  * protocol. The emulator serves plain http, and is allowed for that reason
@@ -59,23 +67,22 @@ function requireHttps(req) {
 }
 
 /**
- * The demo's stand-in for an authenticated session.
+ * The caller's Firebase ID token, from the standard Authorization header.
  *
- * A real deployment would enroll a device inside a logged-in session and
- * never see this token. A shared enrollment token is NOT authentication:
- * anyone holding it can enroll a device for any user id. The README says so
- * in as many words. It exists so the device-key work can be demonstrated
- * without first building the login that Phase 4 brings.
+ * Returns null rather than throwing when there is none, so the refusal
+ * comes from one place -- the service -- and every key-lifecycle route
+ * gives the same answer to an unauthenticated caller.
  */
-const enrollToken = () => process.env.ENROLL_TOKEN || "demo-enroll";
+function bearerToken(req) {
+  const header = String(req.get("authorization") || "");
+  const match = header.match(/^Bearer (.+)$/i);
+  return match ? match[1].trim() : null;
+}
 
-function requireEnrollment(req) {
+/** Every key-lifecycle route: HTTPS, then whatever the session says. */
+function sessionFrom(req) {
   requireHttps(req);
-  const given = Buffer.from(String(req.get("x-enroll-token") || ""), "utf8");
-  const wanted = Buffer.from(enrollToken(), "utf8");
-  if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) {
-    throw new OrderError(401, "Enrollment token required", "BAD_ENROLL_TOKEN");
-  }
+  return bearerToken(req);
 }
 
 /** Pulls sender and text out of whatever shape an SMS forwarder posts. */
@@ -132,26 +139,37 @@ exports.api = onRequest({ region: "asia-south1", cors: true, maxInstances: 5 }, 
       return;
     }
 
-    // Device enrollment and key lifecycle. Online only: every one of
-    // these hands out or retires a secret, and none has an offline path.
+    // Device enrollment and key lifecycle. Online only, over HTTPS, and
+    // every one of them inside a signed-in session: each hands out or
+    // retires a key that can sell shares.
+
+    // Shown to a session that is already signed in. The user reads the
+    // code off this screen and types it into the device being enrolled.
+    if (req.method === "POST" && path === "/enroll/code") {
+      res.json(await app.createEnrollmentCode(sessionFrom(req)));
+      return;
+    }
+
     if (req.method === "POST" && path === "/enroll") {
-      requireEnrollment(req);
       const b = req.body || {};
-      res.json(await app.enrollDevice(String(b.user_id || "")));
+      res.json(await app.enrollDevice(sessionFrom(req), String(b.code || "")));
+      return;
+    }
+
+    if (req.method === "GET" && path === "/devices") {
+      res.json(await app.listDevices(sessionFrom(req)));
       return;
     }
 
     if (req.method === "POST" && path === "/keys/revoke") {
-      requireEnrollment(req);
       const b = req.body || {};
-      res.json(await app.revokeDevice(String(b.key_id || "")));
+      res.json(await app.revokeDevice(sessionFrom(req), String(b.key_id || "")));
       return;
     }
 
     if (req.method === "POST" && path === "/keys/rotate") {
-      requireEnrollment(req);
       const b = req.body || {};
-      res.json(await app.rotateDevice(String(b.key_id || "")));
+      res.json(await app.rotateDevice(sessionFrom(req), String(b.key_id || "")));
       return;
     }
 
