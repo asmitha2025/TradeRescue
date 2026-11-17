@@ -270,11 +270,14 @@ test("each refusal for a validly signed packet is stored and replayed verbatim",
     assert.strictEqual(order.status, code, `${code} should be stored`);
     assert.strictEqual(order.fillPrice, null);
 
-    // And a retry gets the identical answer.
+    // And a retry gets the identical answer, marked as a replay so a
+    // caller can tell a stored answer from a fresh decision.
     const again = await app.executePacket(wire, "SMS", null).then(() => null, (e) => e);
     assert.strictEqual(again.code, code);
     assert.strictEqual(again.message, first.message);
     assert.strictEqual(again.status, first.status);
+    assert.strictEqual(again.replayed, true, `${code} retry should be flagged as a replay`);
+    assert.strictEqual(first.replayed, undefined, `${code} first arrival is not a replay`);
 
     // The retry did not add a second rejection log entry.
     assert.strictEqual((await store.counts()).rejected, 1, `${code} logged once`);

@@ -178,6 +178,75 @@ app/src/main/java/com/traderescue/app/
 app/src/test/.../PacketTest.kt   wire format, signature vectors, SMS size
 ```
 
+## Failure lab
+
+A reliability claim is worth what its evidence is worth, so the claims above
+are checked by pushing a large population of packets through the real
+verify/execute path while an unreliable network does its worst to them.
+
+```
+node tools/lab-selfcheck.js     # first: prove the lab still catches a broken service
+node tools/failure-lab.js       # then: 5 seeds x 10,000 packets
+```
+
+The lab **runs the service logic in-process on `MemoryStore`** with a virtual
+clock — the same signature check, tx_id lookup, expiry arithmetic and
+holdings transaction the deployed function runs. **It does not exercise the
+real SMS network, Firestore, or a broker.** No packet crosses a radio, no
+transaction reaches Google, and no share changes hands.
+
+Faults injected: dropped, duplicated (sequentially and concurrently, up to
+ten copies racing in the same instant), reordered, delayed past expiry,
+tampered with after signing, a second correctly signed packet reusing a
+tx_id for a different order, and a client clock running ahead both inside
+and beyond the two-minute backstop. A clean control group is included,
+because a lab that only ever sees broken deliveries proves nothing about
+working ones.
+
+Latest run — the full output, including per-fault counts and the outcome
+distribution, is in [docs/failure-lab.md](docs/failure-lab.md), regenerated
+by the command above:
+
+| | |
+|---|---|
+| Packets | 50,000 across 5 seeds (base seed `20261117`) |
+| Deliveries processed | 91,104 |
+| Executions | 27,804 |
+| Replays served | 39,169 |
+| Dropped before arrival | 4,045 |
+| Runtime | 2.9s |
+| Invariants | **all 7 held on all 5 seeds** |
+| Boundary cases | **all matched** |
+
+The seven invariants are checked against the **final ledger**, not against
+what each call returned: at most one fill per tx_id; no fill where server
+time passed `expires_at`; no fill from an invalid signature; no conflicting
+packet executed; only one payload per tx_id ever answered, with others
+refused as conflicts; holdings never negative and final holdings exactly
+initial minus the sum of fills; and every replay identical to the stored
+outcome.
+
+`expires_at` is **inclusive**: the server refuses when
+`now > min(expires_at, timestamp + 15 minutes)`, so a packet arriving in the
+same second as its expiry is still executable. The lab asserts that boundary
+explicitly at one second before, exactly at, and one second after, on every
+seed.
+
+### Why the self-check exists
+
+A lab that cannot fail is not evidence. `tools/lab-selfcheck.js` breaks the
+service four ways on purpose — removing the tx_id lookup, ignoring expiry,
+trusting every signature, and treating a conflicting tx_id as a replay — and
+fails if the matching invariant does not fire. It also runs the unmutated
+code first and fails if the lab reports problems with healthy code.
+
+That self-check earned its place immediately: it found that the original six
+invariants all passed while a server handed one order's stored result to a
+*different* order reusing its tx_id. Nothing executed twice, holdings were
+untouched, and the replay did match the record it had been wrongly copied
+from, so every check stayed quiet. The seventh invariant exists because of
+that hole.
+
 ## What is verified, and what isn't
 
 Only what a test actually produced is claimed here.
@@ -225,8 +294,8 @@ production store.
   ledger. Exactly-once is a property of **that ledger**; it says nothing
   about whether a real broker API would double-fill, since a real broker
   has not been called.
-- The failure lab (Phase 2) is not written yet, so no number here comes
-  from running thousands of packets — only from the named tests above.
+- The failure lab's numbers come from `MemoryStore` too. It is the same
+  logic under far more abuse, not a second opinion from a different store.
 
 ## Known limits (deliberate, for a demo)
 

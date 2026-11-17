@@ -80,7 +80,11 @@ class TradeRescue {
     // so a replay reconstructs the identical error. Only the first arrival
     // is logged, or a retry loop would inflate the rejection count itself.
     const error = new OrderError(outcome.http_status, outcome.message, outcome.status);
-    if (!outcome.replayed) await this.recordRejection(error, wire, channel, from);
+    // A replayed refusal says so, the same way a replayed fill does.
+    // Without this a caller cannot tell a terminal answer it has already
+    // been given from one being decided now, and neither can a test.
+    if (outcome.replayed) error.replayed = true;
+    else await this.recordRejection(error, wire, channel, from);
     throw error;
   }
 
