@@ -9,6 +9,14 @@ second channel: the order becomes a 116-character signed packet and goes
 out as a real SMS over the cellular radio, which survives a great deal that
 mobile data does not.
 
+The trading use case is the demo. The engineering problem underneath is
+general: **get an order through an unreliable channel exactly once, without
+trusting the channel.**
+
+> Status: working prototype (Kotlin / Jetpack Compose + Firebase). See
+> [What is verified](#what-is-verified-and-what-isnt) for exactly what has
+> and has not been tested.
+
 > 📹 **Demo video:** _<!-- paste link here -->_
 
 ---
@@ -87,6 +95,35 @@ Each of these was live in code that looked correct and had passing tests:
 | **The StrongBox fallback never worked**, so enrollment crashed on every device without a secure element | instrumented tests on a real emulator |
 | A self-check mutation had gone stale and was silently testing nothing | the self-check's own control run |
 | Six invariants all passed while one order's result was handed to a *different* order reusing its `tx_id` | the self-check's `conflict-as-replay` mutation |
+
+## Reliability design
+
+A packet can be lost, delayed, duplicated, reordered or tampered with, and
+the system still has to behave safely. This table came from an earlier
+version of this README; the mitigations are what the branch now actually
+does, and the right-hand column says where each one is proven.
+
+| Failure or threat | Mitigation | Proven by |
+|---|---|---|
+| Data connection down | HTTPS → SMS → HTTP fallback → simulation, decided when the user authorises | manual checklist |
+| Packet tampered in transit | HMAC-SHA256 over every field, checked before anything else happens | 113 backend tests, lab invariant 3 |
+| Packet duplicated | `tx_id` is the idempotency key; a duplicate replays the stored outcome instead of executing | lab invariants 1 and 8, 8 emulator scenarios |
+| Duplicate arrives after expiry | The `tx_id` lookup runs **before** the expiry check, so a late copy gets the original fill rather than "expired" | lab invariant 2, emulator scenario |
+| Same `tx_id`, different order | SHA-256 of the packet is stored beside it; a mismatch is a conflict, never another order's result | lab invariant 6 |
+| Packet arrives too late | `expires_at`, capped at `timestamp + 15 min` so a packet cannot grant itself more life | lab, boundary cases at ±1s |
+| Phone's clock is wrong | Two-minute skew backstop; a packet from the future is refused | lab invariant, unit tests |
+| Device stolen or retired | Per-device keys, revocable immediately; rotation keeps the old key for one packet lifetime and no longer | 23 key tests, lab invariant 7 |
+| A key signs for the wrong account | The trading account comes from the session claim, not from the packet | enrollment tests |
+| Confirmation SMS forged | The server signs replies with a separate sub-key; an unverifiable reply shows as "Unverified message", never as a fill | unit + instrumented tests |
+| Confirmation reflected as an order | Separate request and response sub-keys, so a reply **is not** a valid order signature | unit tests, lab fault |
+| Oversized or runaway order | Per-holding emergency limit, enforced on the server; the app's check is only a convenience | unit tests, lab invariant 5 |
+| Signature drift across platforms | The same HKDF sub-keys and signature pinned in Node, Kotlin **and** the browser | 3-way pinned tests |
+
+Design rule: **the client is never trusted.** Every limit, signature,
+expiry, key status and account check runs again on the server, which
+assumes the phone is lying.
+
+---
 
 ## Try it without a phone
 
@@ -329,7 +366,7 @@ URL is set in the app, the dashboard shows the server's holdings.
 Requirements: Android Studio (Koala or newer) or just its bundled JDK plus
 the Android SDK. Min SDK 26.
 
-**The app:**
+**The app** (`./gradlew` on macOS and Linux, `gradlew.bat` on Windows):
 
 ```
 gradlew.bat :app:assembleDebug             # APK in app/build/outputs/apk/debug/
@@ -665,6 +702,24 @@ keymaster — a real phone reports TEE or StrongBox) and
   fifty thousand packets.
 
 
+## Roadmap
+
+From the earlier README, with what this branch closed ticked off:
+
+- [x] Per-device keys in the Android Keystore
+- [x] Parse the confirmation SMS to close the "sent vs executed" gap
+- [x] CI: run the tests on every push (GitHub Actions)
+- [x] Idempotency on `tx_id`, documented and tested — duplicate delivery
+      must not execute twice
+- [ ] Run end to end on a physical phone with a SIM and record the demo
+      ([docs/manual-test.md](docs/manual-test.md) is the checklist)
+- [ ] A sign-in screen in the app, so the session token and enrollment code
+      are not pasted in
+- [ ] Asymmetric packet signatures, so the server cannot forge a device's
+      orders — needs a signature that fits one SMS segment
+
+---
+
 ## Known limits (deliberate, for a demo)
 
 - The PIN on the confirm screen is a constant in source. It is a
@@ -684,3 +739,9 @@ keymaster — a real phone reports TEE or StrongBox) and
 - Google Play restricts `SEND_SMS` to default SMS apps and a few approved
   use cases, so this would ship by sideload/enterprise distribution, or
   hand off to the system SMS composer instead.
+
+---
+
+## Author
+
+Built by [Asmitha M](https://github.com/asmitha2025).
