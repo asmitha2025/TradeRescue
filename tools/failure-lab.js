@@ -574,15 +574,23 @@ const tally = (items, key) => {
   return Object.fromEntries(Object.entries(out).sort((a, b) => b[1] - a[1]));
 };
 
-function commitHash() {
+/**
+ * The commit the lab ran against. The dirty check ignores the report file
+ * itself: the lab writes that file, so counting it would mean every run
+ * reported a dirty tree and the flag would stop meaning anything.
+ */
+function commitHash(reportPath) {
+  const root = path.join(__dirname, "..");
+  const git = (args) => execFileSync("git", args, {
+    cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
   try {
-    const out = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
-      cwd: path.join(__dirname, ".."), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    const dirty = execFileSync("git", ["status", "--porcelain"], {
-      cwd: path.join(__dirname, ".."), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return out + (dirty ? " (working tree dirty)" : "");
+    const head = git(["rev-parse", "--short", "HEAD"]);
+    const report = path.relative(root, reportPath).split(path.sep).join("/");
+    const dirty = git(["status", "--porcelain"])
+      .split(/\r?\n/)
+      .filter((line) => line.trim() && !line.slice(3).trim().startsWith(report));
+    return head + (dirty.length ? ` (working tree dirty: ${dirty.length} other file(s))` : "");
   } catch {
     return "unknown";
   }
@@ -616,7 +624,7 @@ function buildReport(runs, opts, elapsedMs) {
   lines.push("## Run");
   lines.push("");
   lines.push(mdTable(["", ""], [
-    ["Commit", "`" + commitHash() + "`"],
+    ["Commit", "`" + commitHash(opts.report) + "`"],
     ["Date", new Date().toISOString()],
     ["Base seed", "`" + opts.seed + "`"],
     ["Seeds run", runs.map((r) => "`" + r.seed + "`").join(", ")],
