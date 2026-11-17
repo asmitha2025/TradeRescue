@@ -211,8 +211,10 @@ by the command above:
 |---|---|
 | Packets | 50,000 across 5 seeds (base seed `20261117`) |
 | Deliveries processed | 91,104 |
-| Executions | 27,804 |
-| Replays served | 39,169 |
+| First-time decisions, **filled** (shares sold) | **27,804** |
+| First-time decisions, refused (on the ledger, nothing sold) | 16,160 |
+| Replays served (no new decision) | 39,169 |
+| Stopped before the ledger (forged or conflicting) | 7,971 |
 | Dropped before arrival | 4,045 |
 | Runtime | 2.9s |
 | Invariants | **all 7 held on all 5 seeds** |

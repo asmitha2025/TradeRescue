@@ -13,14 +13,14 @@ broker.** No packet crosses a radio and no transaction reaches Google.
 
 |  |  |
 |---|---|
-| Commit | `67afe10` |
-| Date | 2026-11-17T06:59:28.068Z |
+| Commit | `9b9dc1b (working tree dirty: 1 other file(s))` |
+| Date | 2026-11-17T09:08:33.912Z |
 | Base seed | `20261117` |
 | Seeds run | `20261117`, `20269036`, `20276955`, `20284874`, `20292793` |
 | Packets per seed | 10,000 |
 | Packets total | 50,000 |
 | Deliveries total | 91,104 |
-| Runtime | 2.9s |
+| Runtime | 5.5s |
 | Node | v24.13.1 |
 
 ## Result
@@ -91,11 +91,20 @@ from the execution it replays.
 | `BAD_ORDER_TYPE` | 845 | 0.93% |
 | `BAD_ORDER_TYPE (replayed)` | 759 | 0.83% |
 
+
+A **first-time decision** is a delivery the server decided and wrote to
+the ledger. Only the filled ones sold anything: the rest are terminal
+refusals that kept their tx_id but moved no shares. Deliveries stopped
+before the ledger (forged, or a tx_id conflict) are counted separately
+again, because they never became an order at all.
+
 |  |  |
 |---|---|
 | Deliveries processed | 91,104 |
-| Executions (fresh fills) | 27,804 |
-| Replays served | 39,169 |
+| First-time decisions &mdash; **filled** (shares actually sold) | **27,804** |
+| First-time decisions &mdash; refused (on the ledger, nothing sold) | 16,160 |
+| Replays served (no new decision) | 39,169 |
+| Stopped before the ledger (forged or conflicting) | 7,971 |
 | Packets dropped before arrival | 4,045 |
 
 ## Reproducing

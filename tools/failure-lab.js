@@ -342,6 +342,16 @@ async function runOnce(seed, packetCount, boundaryCases) {
   return { seed, plans, observations, store, clock, boundaryCases };
 }
 
+/**
+ * Refusals that get a ledger record, as opposed to the ones stopped before
+ * it. A packet refused for one of these came from the keyholder and had its
+ * one decision; a BAD_SIGNATURE or TXID_CONFLICT never claimed a tx_id.
+ */
+const LEDGER_REFUSALS = new Set([
+  "EXPIRED", "CLOCK_SKEW", "BELOW_FLOOR", "OVER_LIMIT", "INSUFFICIENT",
+  "UNKNOWN_SYMBOL", "NOT_SELL", "BAD_ORDER_TYPE", "BAD_QTY", "UNKNOWN_USER",
+]);
+
 function observe(delivery, settled, at) {
   const ok = settled.status === "fulfilled";
   const value = ok ? settled.value : null;
@@ -359,6 +369,10 @@ function observe(delivery, settled, at) {
     outcome: ok ? value.status : error.code,
     replayed: ok ? Boolean(value.replayed) : Boolean(error.replayed),
     filledFresh: ok && value.status === "FILLED" && !value.replayed,
+    // A first-time decision that went onto the ledger but sold nothing:
+    // expired, over limit, below floor and so on. Counted apart from fills
+    // so "decisions" can never be read as "sells".
+    refusedFresh: !ok && !error.replayed && LEDGER_REFUSALS.has(error.code),
     // Rebuilt to the same shape the ledger stores for a refusal, tx_id
     // included, so invariant 7 compares like with like rather than
     // reporting a missing field as a mismatch.
@@ -707,12 +721,23 @@ function buildReport(runs, opts, elapsedMs) {
       "`" + name + "`", n.toLocaleString("en-US"), ((100 * n) / allObs.length).toFixed(2) + "%",
     ])));
   lines.push("");
-  const fresh = allObs.filter((o) => o.filledFresh).length;
+  const filled = allObs.filter((o) => o.filledFresh).length;
+  const refused = allObs.filter((o) => o.refusedFresh).length;
   const replays = allObs.filter((o) => o.replayed).length;
+  const preLedger = allObs.filter((o) => !o.filledFresh && !o.refusedFresh && !o.replayed).length;
+  lines.push("");
+  lines.push("A **first-time decision** is a delivery the server decided and wrote to");
+  lines.push("the ledger. Only the filled ones sold anything: the rest are terminal");
+  lines.push("refusals that kept their tx_id but moved no shares. Deliveries stopped");
+  lines.push("before the ledger (forged, or a tx_id conflict) are counted separately");
+  lines.push("again, because they never became an order at all.");
+  lines.push("");
   lines.push(mdTable(["", ""], [
     ["Deliveries processed", allObs.length.toLocaleString("en-US")],
-    ["Executions (fresh fills)", fresh.toLocaleString("en-US")],
-    ["Replays served", replays.toLocaleString("en-US")],
+    ["First-time decisions &mdash; **filled** (shares actually sold)", "**" + filled.toLocaleString("en-US") + "**"],
+    ["First-time decisions &mdash; refused (on the ledger, nothing sold)", refused.toLocaleString("en-US")],
+    ["Replays served (no new decision)", replays.toLocaleString("en-US")],
+    ["Stopped before the ledger (forged or conflicting)", preLedger.toLocaleString("en-US")],
     ["Packets dropped before arrival", allPlans.filter((p) => p.fault === "drop").length.toLocaleString("en-US")],
   ]));
   lines.push("");
@@ -763,9 +788,11 @@ async function main() {
     runs.push(run);
 
     const bad = run.invariants.filter((i) => !i.pass).length + run.boundaries.filter((b) => !b.pass).length;
-    say(`  seed ${seed}: ${run.observations.length.toLocaleString("en-US")} deliveries, ` +
-      `${run.observations.filter((o) => o.filledFresh).length.toLocaleString("en-US")} fills, ` +
-      `${run.observations.filter((o) => o.replayed).length.toLocaleString("en-US")} replays — ` +
+    const n = (predicate) => run.observations.filter(predicate).length.toLocaleString("en-US");
+    say(`  seed ${seed}: ${run.observations.length.toLocaleString("en-US")} deliveries — ` +
+      `${n((o) => o.filledFresh)} filled, ` +
+      `${n((o) => o.refusedFresh)} refused, ` +
+      `${n((o) => o.replayed)} replayed — ` +
       (bad === 0 ? "all invariants held" : `${bad} FAILURE(S)`));
   }
 
