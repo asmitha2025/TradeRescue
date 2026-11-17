@@ -16,10 +16,30 @@ directly.
 [demo/index.html](demo/index.html) is a single-page interactive demo: the
 phone, the security engine and the admin dashboard side by side. Turn the
 phone's data off, sell, and watch the signed SMS get checked and land on
-the dashboard. It also has buttons that send tampered, replayed, expired
-and over-limit packets. Signing and every server check are the same as the
-real backend; the SMS hop and the exchange are simulated. Open the file in
-any browser, or publish the repo with GitHub Pages.
+the dashboard. Open the file in any browser, or publish the repo with
+GitHub Pages.
+
+**It is a simulation of the server checks, not the backend running in your
+browser.** The page contains a second implementation in JavaScript that
+mirrors `firebase/functions/` — the same checks in the same order — so you
+can watch each one decide. The TRX2 format, the HMAC signing, the tx_id
+ledger, expiry, limits and the floor behave as the real server does; the
+SMS hop, Firestore and the exchange are simulated, the ledger lives in the
+tab and resets with the page, and no broker is involved.
+
+Because it is a second implementation, the demo proves nothing by itself.
+Each button corresponds to a backend test that does:
+
+| Button | What it shows | Proven by |
+|---|---|---|
+| **Resend the same SMS** | Exactly-once: the duplicate returns the original result and the holding does not move | `the same tx_id with the same bytes replays the stored result`, and `ten concurrent copies of a packet fill once and replay the identical result` |
+| **Tampered replay** | Same `tx_id`, a different order, correctly signed → conflict, never executed | `the same tx_id with different bytes is a conflict, not someone else's result` |
+| **Forge a packet** | Quantity changed after signing → refused, and no `tx_id` is claimed | `a forged packet is refused, recorded, and changes nothing`, and `a forgery cannot burn the tx_id the real device is about to use` |
+| **Expired packet** | Signed correctly but 20 minutes late → refused, and the refusal is terminal | `a packet first seen after its expiry is refused`, and `an expired refusal is not re-decided if the clock comes back in range` |
+| **Over the limit** | More shares than the pre-authorized emergency limit → refused | `each refusal for a validly signed packet is stored and replayed verbatim` (the `OVER_LIMIT` case) |
+
+All of those live in `firebase/functions/test/service.test.js` and run with
+`npm test`.
 
 ## How it works
 

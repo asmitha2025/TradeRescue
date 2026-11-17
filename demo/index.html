@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Interactive demo: sell a stock with the internet off. The order travels as a signed SMS, the server checks it, and the dashboard updates live.">
+</head>
+<body>
+<title>TradeRescue Live Demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+  /* Layout: three panes left to right, following one order's journey:
+     the phone that sends it, the engine that checks it, the dashboard that records it.
+     One deliberate light look (projectors, screen shares); the phone keeps the app's own dark skin. */
+  :root {
+    color-scheme: light;
+    --bg: #f5f6f8; --surface: #ffffff; --line: #e2e5ea; --line-2: #eef0f3;
+    --ink: #12151b; --ink-2: #485060; --ink-3: #6b7284;
+    --brand: #1d5fd6; --brand-soft: #e7eefb;
+    --sms: #b9770a; --sms-soft: #fcefd1;
+    --good: #0b7448; --good-soft: #def4e7; --bad: #b02a1f; --bad-soft: #fbe6e3; --fresh: #fdf3dc;
+    --phone: #0b0d12; --app-bg: #05070b; --app-card: #131824; --app-line: #232b3d;
+    --app-ink: #e8eaed; --app-ink-2: #9aa2b2; --app-amber: #f5a623; --app-green: #35d18c; --app-red: #ff6b5c;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Consolas, "SF Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--ink); }
+  body { font: 14px/1.5 var(--sans); }
+  .wrap { max-width: 1440px; margin: 0 auto; padding-inline: 20px; padding-block: 18px 40px; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  button:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  .mono { font-family: var(--mono); }
+  .num { font-variant-numeric: tabular-nums; text-align: right; }
+
+  /* Header */
+  .top { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 24px; margin-bottom: 18px; }
+  .top .title { flex: 1 1 520px; min-width: 0; }
+  .eyebrow { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--brand); }
+  h1 { font-size: 28px; line-height: 1.15; margin: 4px 0 6px; letter-spacing: -0.02em; text-wrap: balance; }
+  .lede { margin: 0; color: var(--ink-2); max-width: 70ch; }
+  .top-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 8px 14px; font-weight: 500; }
+  .btn:hover:not(:disabled) { border-color: var(--ink-3); }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* Three panes */
+  .stage { display: grid; gap: 16px; grid-template-columns: 340px minmax(0, 1fr) minmax(0, 1.35fr); align-items: start; }
+  @media (max-width: 1240px) { .stage { grid-template-columns: 340px minmax(0, 1fr); } .pane.dash { grid-column: 1 / -1; } }
+  @media (max-width: 760px) { .stage { grid-template-columns: minmax(0, 1fr); } }
+  .pane { min-width: 0; }
+  .pane-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin: 0 2px 8px; }
+  .pane-head h2 { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); margin: 0; }
+  .pane-head span { font-size: 12px; color: var(--ink-3); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+
+  /* Phone */
+  .phone { width: 100%; max-width: 340px; margin: 0 auto; background: var(--phone); border-radius: 38px; padding: 12px; box-shadow: 0 18px 40px -22px rgba(18, 21, 27, 0.55); }
+  .screen { position: relative; background: var(--app-bg); color: var(--app-ink); border-radius: 28px; height: 620px; overflow: hidden; display: flex; flex-direction: column; }
+  .statusbar { display: flex; justify-content: space-between; align-items: center; padding: 10px 20px 4px; font-size: 12px; color: var(--app-ink); font-variant-numeric: tabular-nums; }
+  .sb-icons { display: flex; gap: 8px; align-items: center; }
+  .bars { display: inline-flex; align-items: flex-end; gap: 2px; height: 11px; }
+  .bars i { width: 3px; background: var(--app-ink); border-radius: 1px; }
+  .net { font-size: 10px; font-weight: 600; letter-spacing: 0.04em; padding: 1px 5px; border-radius: 4px; border: 1px solid var(--app-ink-2); }
+  .net.off { color: var(--app-red); border-color: var(--app-red); text-decoration: line-through; }
+  .app { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 8px 18px 18px; overflow-y: auto; }
+  .app-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .app h3 { font-size: 17px; margin: 0; }
+  .muted { color: var(--app-ink-2); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; border: 1px solid var(--app-line); border-radius: 20px; padding: 4px 10px; }
+  .pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.on { color: var(--app-green); } .pill.off { color: var(--app-red); }
+  .big { font-size: 30px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+  .hold { display: flex; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--app-line); }
+  .hold:last-child { border-bottom: 0; }
+  .hold b { font-weight: 600; }
+  .hold small { display: block; color: var(--app-ink-2); font-size: 12px; }
+  .up { color: var(--app-green); } .down { color: var(--app-red); }
+  .grow { flex: 1; }
+  .app-btn { width: 100%; border: 0; border-radius: 14px; padding: 15px; font-weight: 600; font-size: 15px; background: var(--app-amber); color: #17110a; }
+  .app-btn.ghost { background: transparent; color: var(--app-ink); border: 1px solid var(--app-line); }
+  .app-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .back { background: none; border: 0; color: var(--app-amber); padding: 0; font-size: 14px; align-self: flex-start; margin-bottom: 6px; }
+  .pick { width: 100%; text-align: left; background: var(--app-card); border: 1px solid var(--app-line); border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; color: var(--app-ink); }
+  .pick:disabled { opacity: 0.45; cursor: not-allowed; }
+  .qty { font-size: 64px; font-weight: 600; text-align: center; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .steppers { display: flex; justify-content: center; gap: 22px; margin: 8px 0; }
+  .round { width: 52px; height: 52px; border-radius: 50%; border: 0; background: var(--app-card); color: var(--app-ink); font-size: 22px; }
+  .round:disabled { opacity: 0.35; cursor: not-allowed; }
+  .box { background: var(--app-card); border: 1px solid var(--app-line); border-radius: 12px; padding: 12px; text-align: center; }
+  .dots { display: flex; gap: 14px; justify-content: center; margin: 16px 0 6px; }
+  .dots i { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--app-ink-2); }
+  .dots i.f { background: var(--app-ink); border-color: var(--app-ink); }
+  .keys { display: grid; grid-template-columns: repeat(3, 60px); gap: 12px; justify-content: center; margin-top: 10px; }
+  .key { width: 60px; height: 60px; border-radius: 50%; border: 0; background: var(--app-card); color: var(--app-ink); font-size: 20px; }
+  .err { color: var(--app-red); font-size: 13px; text-align: center; min-height: 20px; }
+  .step { display: flex; gap: 8px; padding: 6px 0; font-size: 14px; }
+  .step .ok { color: var(--app-green); }
+  .spin { width: 14px; height: 14px; border: 2px solid var(--app-line); border-top-color: var(--app-amber); border-radius: 50%; animation: spin 0.8s linear infinite; flex: none; margin-top: 3px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .pkt { background: var(--app-card); border: 1px solid var(--app-line); border-radius: 10px; padding: 10px; margin-top: 10px; }
+  .pkt small { color: var(--app-ink-2); font-size: 11px; }
+  .pkt code { display: block; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; word-break: break-all; margin-top: 4px; color: var(--app-ink); }
+  .tick { width: 60px; height: 60px; border-radius: 50%; display: grid; place-items: center; font-size: 26px; color: #06251a; margin: 0 auto 12px; }
+  .center { text-align: center; }
+  .toast { position: absolute; left: 10px; right: 10px; top: 34px; background: #1d2433; border: 1px solid #2f3a52; border-radius: 16px; padding: 10px 12px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45); transform: translateY(-24px); opacity: 0; visibility: hidden; transition: transform 0.45s cubic-bezier(.2, .8, .2, 1), opacity 0.3s, visibility 0.3s; z-index: 3; }
+  .toast.show { transform: translateY(0); opacity: 1; visibility: visible; }
+  .toast .from { font-size: 11px; color: var(--app-ink-2); display: flex; justify-content: space-between; }
+  .toast p { margin: 3px 0 0; font-size: 13px; line-height: 1.4; color: var(--app-ink); }
+  .controls { max-width: 340px; margin: 12px auto 0; display: grid; gap: 10px; }
+  .switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; }
+  .switch strong { display: block; font-size: 14px; }
+  .switch small { color: var(--ink-3); font-size: 12px; }
+  .toggle { position: relative; width: 46px; height: 26px; border-radius: 13px; border: 0; background: var(--good); flex: none; transition: background 0.2s; }
+  .toggle::after { content: ""; position: absolute; top: 3px; left: 23px; width: 20px; height: 20px; border-radius: 50%; background: #fff; transition: left 0.2s; }
+  .toggle[aria-checked="false"] { background: #b8bec9; }
+  .toggle[aria-checked="false"]::after { left: 3px; }
+  .guide { margin: 0; padding: 10px 14px 10px 32px; font-size: 13px; color: var(--ink-2); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+  .guide li { padding: 2px 0; }
+  .guide li.done { color: var(--good); }
+  .guide li.done::marker { content: "✓  "; }
+
+  /* Engine */
+  .wire { padding: 14px 16px; }
+  .route { display: grid; grid-template-columns: repeat(4, 1fr); position: relative; margin: 6px 0 4px; }
+  .route::before { content: ""; position: absolute; left: 12.5%; right: 12.5%; top: 9px; height: 2px; background: var(--line); }
+  .node { text-align: center; font-size: 12px; color: var(--ink-3); position: relative; }
+  .node i { display: block; width: 20px; height: 20px; margin: 0 auto 4px; border-radius: 50%; background: var(--surface); border: 2px solid var(--line); }
+  .node.lit { color: var(--ink); } .node.lit i { border-color: var(--sms); background: var(--sms-soft); }
+  .route.web .node.lit i { border-color: var(--brand); background: var(--brand-soft); }
+  .packet-dot { position: absolute; top: 3px; left: 12.5%; width: 14px; height: 14px; margin-left: -7px; border-radius: 50%; background: var(--sms); opacity: 0; transition: left 0.6s ease-in-out, opacity 0.2s; }
+  .route.web .packet-dot { background: var(--brand); }
+  .wire-label { font-size: 13px; color: var(--ink-2); margin: 8px 0 0; min-height: 20px; }
+  .attacks { padding: 14px 16px; border-top: 1px solid var(--line-2); }
+  .attacks p { margin: 0 0 10px; font-size: 13px; color: var(--ink-2); }
+  .attack-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .attack { text-align: left; border: 1px solid var(--line); background: var(--surface); border-radius: 10px; padding: 9px 11px; }
+  .attack strong { display: block; font-size: 13px; }
+  .attack small { color: var(--ink-3); font-size: 12px; }
+  .attack:hover:not(:disabled) { border-color: var(--bad); }
+  .attack.proof:hover:not(:disabled) { border-color: var(--sms); }
+  .attack:disabled { opacity: 0.45; cursor: not-allowed; }
+  .feed { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 10px; }
+  .feed-empty { color: var(--ink-3); font-size: 13px; padding: 16px; text-align: center; border: 1px dashed var(--line); border-radius: 12px; }
+  .ev { padding: 12px 14px; }
+  .ev-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; font-size: 13px; }
+  .ev-head b { font-weight: 600; }
+  .ev-time { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .ev code { display: block; font-family: var(--mono); font-size: 11.5px; word-break: break-all; color: var(--ink-2); background: var(--bg); border-radius: 8px; padding: 6px 8px; margin: 8px 0; }
+  .checks { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; font-size: 13px; }
+  .checks li { display: flex; gap: 8px; align-items: baseline; }
+  .checks .s { width: 16px; flex: none; text-align: center; font-weight: 700; }
+  .checks .ok .s { color: var(--good); } .checks .no .s { color: var(--bad); } .checks .no { color: var(--bad); }
+  .checks .skip { color: var(--ink-3); } .checks .wait { color: var(--ink-3); }
+  .checks .replay .s { color: var(--sms); } .checks .replay { color: var(--sms); font-weight: 600; }
+  .verdict { margin-top: 8px; font-size: 13px; }
+
+  /* Badges shared by engine and dashboard */
+  .badge { display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; padding: 1px 8px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+  .badge.ok { background: var(--good-soft); color: var(--ink); } .badge.ok b { color: var(--good); }
+  .badge.no { background: var(--bad-soft); color: var(--ink); } .badge.no b { color: var(--bad); }
+  .chan { display: inline-block; border: 1px solid var(--line); border-radius: 6px; padding: 0 7px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  .chan.sms { border-color: var(--sms); background: var(--sms-soft); color: var(--ink); font-weight: 600; }
+
+  /* Dashboard */
+  .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+  @media (max-width: 560px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .tile { padding: 12px 14px; }
+  .tile .label { font-size: 12px; color: var(--ink-3); }
+  .tile .value { display: inline-block; font-size: 24px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; border-radius: 6px; transform-origin: left center; }
+  .tile .value.brand { color: var(--brand); }
+  .tile .note { font-size: 12px; color: var(--ink-2); min-height: 18px; }
+  .bump { animation: bump 1.3s ease-out; }
+  @keyframes bump { 0% { transform: scale(1.16); background: var(--fresh); } 100% { transform: scale(1); background: transparent; } }
+  .tbl-card + .tbl-card { margin-top: 12px; }
+  .tbl-head { display: flex; justify-content: space-between; align-items: baseline; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  .tbl-head h3 { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-2); margin: 0; }
+  .tbl-head span { font-size: 12px; color: var(--ink-3); }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; font-weight: 500; color: var(--ink-3); padding: 8px 9px; white-space: nowrap; }
+  td { padding: 9px; border-top: 1px solid var(--line-2); white-space: nowrap; }
+  th:first-child, td:first-child { padding-left: 14px; } th:last-child, td:last-child { padding-right: 14px; }
+  td.wrap { white-space: normal; min-width: 180px; }
+  .meter { height: 5px; border-radius: 3px; background: var(--line); margin-top: 4px; min-width: 64px; overflow: hidden; }
+  .meter i { display: block; height: 100%; background: var(--brand); border-radius: 3px; transition: width 0.7s ease; }
+  .q { display: inline-block; border-radius: 4px; }
+  tr.fresh td { animation: fresh 3.5s ease-out; }
+  @keyframes fresh { from { background: var(--fresh); } to { background: transparent; } }
+  .empty td { text-align: center; color: var(--ink-3); padding: 18px 14px; white-space: normal; }
+
+  .foot { margin-top: 22px; display: grid; gap: 6px; font-size: 13px; color: var(--ink-2); max-width: 90ch; }
+  .foot strong { color: var(--ink); }
+  .foot a { color: var(--brand); }
+  @media (prefers-reduced-motion: reduce) { .bump, tr.fresh td, .spin, .toast, .packet-dot, .meter i { animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="title">
+      <div class="eyebrow">Interactive demo</div>
+      <h1>TradeRescue: sell a stock with the internet off</h1>
+      <p class="lede">Turn the phone's data off and place an emergency sell. The order leaves as a signed SMS, the security engine checks it, the sell executes, and a confirmation SMS comes back. Everything below runs in your browser.</p>
+    </div>
+    <div class="top-actions">
+      <button class="btn" id="reset" type="button">Reset demo</button>
+    </div>
+  </header>
+
+  <main class="stage">
+    <section class="pane" aria-label="Phone">
+      <div class="pane-head"><h2>Trader's phone</h2><span>TradeRescue app</span></div>
+      <div class="phone">
+        <div class="screen">
+          <div class="statusbar"><span id="clock">9:41</span><span class="sb-icons"><span class="bars" aria-hidden="true"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px"></i><i style="height:11px"></i></span><span class="net" id="netBadge">4G</span></span></div>
+          <div class="toast" id="toast" role="status" aria-live="polite"><div class="from"><span>Messages · TradeRescue</span><span id="toastTime">now</span></div><p id="toastText"></p></div>
+          <div class="app" id="app"></div>
+        </div>
+      </div>
+      <div class="controls">
+        <div class="switch">
+          <div><strong>Mobile data</strong><small id="dataNote">On. Orders go over the internet.</small></div>
+          <button class="toggle" id="dataToggle" type="button" role="switch" aria-checked="true" aria-label="Mobile data"></button>
+        </div>
+        <ol class="guide" id="guide">
+          <li>Turn mobile data off</li>
+          <li>Tap Emergency Sell, pick TCS</li>
+          <li>Choose 3 shares and confirm</li>
+          <li>Enter PIN 1234</li>
+          <li>Watch the SMS reach the server and the reply come back</li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="pane" aria-label="Security engine">
+      <div class="pane-head"><h2>Security engine</h2><span>Every packet, every check</span></div>
+      <div class="card">
+        <div class="wire">
+          <div class="route" id="route">
+            <div class="node" data-n="0"><i></i>Phone</div>
+            <div class="node" data-n="1"><i></i><span id="hopLabel">SMS network</span></div>
+            <div class="node" data-n="2"><i></i>Gateway</div>
+            <div class="node" data-n="3"><i></i>Server</div>
+            <span class="packet-dot" id="dot"></span>
+          </div>
+          <p class="wire-label" id="wireLabel">Waiting for an order.</p>
+        </div>
+        <div class="attacks">
+          <p>Try to break it. These send an SMS straight to the server, skipping the phone. Four are hostile; <strong>Resend the same SMS</strong> is the exactly-once guarantee being shown rather than attacked.</p>
+          <div class="attack-grid">
+            <button class="attack" type="button" data-attack="tamper"><strong>Forge a packet</strong><small>Change the quantity, keep the signature</small></button>
+            <button class="attack proof" type="button" data-attack="replay" id="replayBtn"><strong>Resend the same SMS</strong><small>Exactly-once: the duplicate returns the original result</small></button>
+            <button class="attack" type="button" data-attack="conflict" id="conflictBtn"><strong>Tampered replay</strong><small>Same tx_id, different order → conflict</small></button>
+            <button class="attack" type="button" data-attack="expired"><strong>Expired packet</strong><small>Signed correctly, but 20 minutes late</small></button>
+            <button class="attack" type="button" data-attack="limit"><strong>Over the limit</strong><small>Sell 30 HDFCBANK, limit is 25</small></button>
+          </div>
+        </div>
+      </div>
+      <ol class="feed" id="feed"></ol>
+    </section>
+
+    <section class="pane dash" aria-label="Admin dashboard">
+      <div class="pane-head"><h2>Admin dashboard</h2><span>Broker's view, updates live</span></div>
+      <div class="tiles">
+        <div class="card tile"><div class="label">Portfolio value</div><div class="value brand" id="kValue">–</div><div class="note" id="kValueNote"></div></div>
+        <div class="card tile"><div class="label">Orders filled</div><div class="value" id="kFilled">0</div><div class="note" id="kFilledNote"></div></div>
+        <div class="card tile"><div class="label">Received by SMS</div><div class="value" id="kSms">0</div><div class="note">No data connection</div></div>
+        <div class="card tile"><div class="label">Refused</div><div class="value" id="kRej">0</div><div class="note">Forged, conflicting, expired, over limit. A duplicate is not refused — it replays.</div></div>
+      </div>
+      <div class="card tbl-card">
+        <div class="tbl-head"><h3>Holdings</h3><span>User U10021</span></div>
+        <div class="scroll"><table><thead><tr><th>Stock</th><th>Shares left</th><th class="num">Limit</th><th class="num">Price</th><th class="num">Value</th></tr></thead><tbody id="holdings"></tbody></table></div>
+      </div>
+      <div class="card tbl-card">
+        <div class="tbl-head"><h3>Orders</h3><span>Newest first</span></div>
+        <div class="scroll"><table><thead><tr><th>Time</th><th>Status</th><th>Stock</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Proceeds</th><th>Channel</th><th>Ref</th></tr></thead><tbody id="orders"></tbody></table></div>
+      </div>
+      <div class="card tbl-card">
+        <div class="tbl-head"><h3>Rejected packets</h3><span>Stopped before anything was sold</span></div>
+        <div class="scroll"><table><thead><tr><th>Time</th><th>Status</th><th>Reason</th><th>From</th></tr></thead><tbody id="rejections"></tbody></table></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <div><strong>This page is a simulation of the server checks</strong>, not the backend running in your browser. The checks below are a second implementation in JavaScript that mirrors the real one in <code>firebase/functions/</code>, in the same order, so you can watch each one decide. Real: the TRX2 packet format and HMAC-SHA256 signing (your browser's Web Crypto), the signature check, the tx_id ledger and its exactly-once replay, expiry, the holdings and per-stock emergency limit, and the optional price floor.</div>
+    <div><strong>What is simulated:</strong> the SMS hop, Firestore, and the exchange. Fills are at the last price, the ledger lives in this tab and resets with the page, and no broker is involved. On real phones the same packet goes out as an actual SMS. The guarantees this page shows are tested for real in the repo's backend test suite — see the README for which test covers which button.</div>
+    <div>Source: <a href="https://github.com/asmitha2025/TradeRescue" target="_blank" rel="noopener">github.com/asmitha2025/TradeRescue</a></div>
+  </footer>
+</div>
+
+<script>
+(() => {
+  // ---- Shared constants (same values as PacketSigner.kt and packet.js) ----
+  const SECRET = "TRADERESCUE_DEMO_SECRET_NOT_FOR_PRODUCTION";
+  const USER = "U10021", PIN = "1234", ME = "+91 98••• ••210";
+  // Mirrors packet.js: expires_at is the primary lateness check, and the
+  // server takes whichever comes first of it and timestamp + MAX_VALIDITY,
+  // so a packet cannot grant itself a longer life. MAX_SKEW is the backstop
+  // against a client clock that is ahead of ours.
+  const MAX_VALIDITY = 15 * 60, MAX_SKEW = 2 * 60, DEFAULT_VALIDITY = 10 * 60;
+  const START = [
+    { symbol: "RELIANCE", qty: 20, price: 1485.2, chg: -0.8, limit: 20 },
+    { symbol: "TCS", qty: 10, price: 3421.5, chg: 0.3, limit: 50 },
+    { symbol: "INFY", qty: 15, price: 1612.3, chg: -1.2, limit: 30 },
+    { symbol: "HDFCBANK", qty: 40, price: 1642.5, chg: 0.6, limit: 25 },
+  ];
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const wait = (ms) => new Promise((r) => setTimeout(r, reduced ? Math.min(ms, 120) : ms));
+  const $ = (id) => document.getElementById(id);
+  const inr = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 2 });
+  const inr0 = new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 });
+  const hhmmss = (d = new Date()) => d.toLocaleTimeString("en-IN", { hour12: false });
+  const istStamp = () => new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" }).format(new Date()).replace(/[^\x20-\x7e]/g, " ") + " IST";
+  const randomHex = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => b.toString(16).padStart(2, "0")).join("");
+
+  // ---- Signing: HMAC-SHA256 truncated to 32 hex chars ----
+  let keyPromise = null;
+  async function sign(payload) {
+    keyPromise = keyPromise || crypto.subtle.importKey("raw", new TextEncoder().encode(SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sig = await crypto.subtle.sign("HMAC", await keyPromise, new TextEncoder().encode(payload));
+    return Array.from(new Uint8Array(sig), (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+  }
+  // SHA-256 of the exact packet bytes: how the server tells a genuine retry
+  // from a different order reusing a tx_id.
+  async function hashPacket(canonical) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // TRX2|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+  // order_type "I" is immediate-or-cancel; floor is paise, 0 = any price.
+  async function buildPacket(symbol, qty, { tsOffset = 0, floorPaise = 0, validity = DEFAULT_VALIDITY, txId = null } = {}) {
+    const ts = Math.floor(Date.now() / 1000) + tsOffset;
+    const payload = [
+      "TRX2", txId || "TRX" + randomHex(3).toUpperCase(), USER, "S", symbol, qty, "I",
+      floorPaise, ts + validity, randomHex(4), ts,
+    ].join("|");
+    return `${payload}|${await sign(payload)}`;
+  }
+
+  // ---- State ----
+  let S;
+  function fresh() {
+    S = {
+      holdings: START.map((h) => ({ ...h })), orders: [], rejections: [],
+      // tx_id -> { hash, outcome }: the ledger. Every decided packet is in
+      // here, filled or refused, and that decision is final.
+      ledger: new Map(),
+      lastGood: null, data: true, screen: "home", sel: null, qty: 1, pin: "", pinErr: "",
+      steps: [], packet: null, busy: false, result: null, firstRender: true,
+    };
+  }
+  const holding = (sym) => S.holdings.find((h) => h.symbol === sym);
+  const cap = (h) => Math.min(h.qty, h.limit);
+
+  // ---- Server: the same checks, in the same order, as the real backend ----
+  //
+  // This is a second implementation in browser JavaScript, not the backend's
+  // code running here. It mirrors firebase/functions/packet.js, engine.js and
+  // service.js, and the order of the checks is the part that matters:
+  //
+  //   signature -> tx_id lookup -> expiry -> limits and floor -> execute
+  //
+  // The lookup sitting before expiry is why a duplicate that turns up late
+  // gets the original fill back instead of being told it is too late.
+  //
+  // Returns the outcome plus the list of checks, so the engine pane can show
+  // exactly which one decided the packet.
+  async function serverReceive(wire, from) {
+    const checks = [
+      { name: "Packet format (TRX2)", st: "wait" },
+      { name: "Signature (HMAC-SHA256)", st: "wait" },
+      { name: "tx_id not already decided", st: "wait" },
+      { name: "Not expired (expires_at)", st: "wait" },
+      { name: "Holding, emergency limit and floor", st: "wait" },
+    ];
+    // Stopped before the ledger: forged, malformed, or reusing a tx_id that
+    // belongs to a different order. Nothing like this can claim a tx_id.
+    const reject = (i, reason) => {
+      checks[i].st = "no";
+      for (let j = i + 1; j < checks.length; j++) checks[j].st = "skip";
+      S.rejections.unshift({ id: randomHex(4), at: new Date(), reason, from });
+      return { ok: false, reason, checks, reply: `TradeRescue: order REJECTED, nothing was sold. ${reason}. ${istStamp()}` };
+    };
+
+    const canonical = String(wire).trim();
+    const parts = canonical.split("|");
+    if (parts.length !== 12 || parts[0] !== "TRX2") return reject(0, "Not a TRX2 TradeRescue packet");
+    checks[0].st = "ok";
+
+    const [, txId, , action, symbol, qtyText, orderType, floorText, expiresText, , tsText, sig] = parts;
+    if ((await sign(parts.slice(0, 11).join("|"))) !== sig) return reject(1, "Signature check failed");
+    checks[1].st = "ok";
+
+    // The ledger lookup. A tx_id that was already decided is never decided
+    // again, whatever has changed in the meantime.
+    const hash = await hashPacket(canonical);
+    const prior = S.ledger.get(txId);
+    if (prior) {
+      if (prior.hash !== hash) return reject(2, "This tx_id was already used by a different order");
+      checks[2].st = "replay";
+      for (let j = 3; j < checks.length; j++) checks[j].st = "skip";
+      return { ...prior.outcome, replayed: true, checks };
+    }
+    checks[2].st = "ok";
+
+    // Everything from here is terminal: it goes on the ledger, and a retry is
+    // answered from that record rather than worked out again.
+    const decide = (i, reason) => {
+      checks[i].st = "no";
+      for (let j = i + 1; j < checks.length; j++) checks[j].st = "skip";
+      S.rejections.unshift({ id: randomHex(4), at: new Date(), reason, from });
+      return { ok: false, reason, reply: `TradeRescue: order REJECTED, nothing was sold. ${reason}. ${istStamp()}` };
+    };
+    const outcome = (() => {
+      const now = Math.floor(Date.now() / 1000), ts = Number(tsText);
+      if (ts - now > MAX_SKEW) return decide(3, "Packet timestamp is in the future");
+      // Whichever comes first: the packet's own expiry, or the server's cap.
+      const expiry = Math.min(Number(expiresText), ts + MAX_VALIDITY);
+      if (now > expiry) return decide(3, "Packet expired before it could be executed");
+      checks[3].st = "ok";
+
+      const h = holding(symbol), qty = Number(qtyText), floorPaise = Number(floorText);
+      if (action !== "S") return decide(4, "The emergency channel only accepts sell orders");
+      if (orderType !== "I") return decide(4, "The emergency channel places immediate-or-cancel orders only");
+      if (!h) return decide(4, `You do not hold ${symbol}`);
+      if (!Number.isInteger(qty) || qty < 1) return decide(4, "Quantity must be a whole number above zero");
+      if (qty > h.qty) return decide(4, `Only ${h.qty} shares of ${symbol} available`);
+      if (qty > h.limit) return decide(4, `Emergency limit for ${symbol} is ${h.limit} shares`);
+      if (floorPaise > 0 && Math.round(h.price * 100) < floorPaise) {
+        return decide(4, `${symbol} is at Rs ${h.price.toFixed(2)}, below your floor of Rs ${(floorPaise / 100).toFixed(2)}`);
+      }
+      checks[4].st = "ok";
+
+      h.qty -= qty;
+      const proceeds = Math.round(qty * h.price * 100) / 100;
+      S.orders.unshift({ txId, symbol, qty, price: h.price, proceeds, channel: "SMS", at: new Date() });
+      return {
+        ok: true,
+        reply: `TradeRescue: SOLD ${qty} ${symbol} @ Rs ${h.price.toFixed(2)}. Total Rs ${proceeds.toFixed(2)}. ${h.qty} shares left. ${istStamp()}. Ref ${txId}`,
+      };
+    })();
+
+    // Filled or refused, this tx_id now has one answer and keeps it.
+    S.ledger.set(txId, { hash, outcome });
+    return { ...outcome, checks };
+  }
+
+  // ---- Engine pane ----
+  function route(kind, upTo, label) {
+    const r = $("route");
+    r.classList.toggle("web", kind === "web");
+    $("hopLabel").textContent = kind === "web" ? "Internet" : "SMS network";
+    r.querySelectorAll(".node").forEach((n) => n.classList.toggle("lit", Number(n.dataset.n) <= upTo));
+    const dot = $("dot");
+    if (upTo < 0) { dot.style.opacity = 0; dot.style.left = "12.5%"; } else { dot.style.opacity = 1; dot.style.left = (12.5 + upTo * 25) + "%"; }
+    $("wireLabel").textContent = label;
+  }
+  async function travel(kind, label) {
+    route(kind, 0, label);
+    for (let i = 1; i <= 3; i++) { await wait(650); route(kind, i, label); }
+  }
+  function addEvent(title, wire, result) {
+    $("feed").querySelector(".feed-empty")?.remove();
+    const li = document.createElement("li");
+    li.className = "card ev";
+    const head = document.createElement("div"); head.className = "ev-head";
+    const b = document.createElement("b"); b.textContent = title;
+    const t = document.createElement("span"); t.className = "ev-time"; t.textContent = hhmmss();
+    head.append(b, t); li.append(head);
+    if (wire) { const c = document.createElement("code"); c.textContent = wire; li.append(c); }
+    const ul = document.createElement("ul"); ul.className = "checks"; li.append(ul);
+    const verdict = document.createElement("div"); verdict.className = "verdict"; li.append(verdict);
+    $("feed").prepend(li);
+    while ($("feed").children.length > 8) $("feed").lastElementChild.remove();
+    return {
+      async play() {
+        for (const c of result.checks) {
+          const row = document.createElement("li"); row.className = c.st;
+          const s = document.createElement("span"); s.className = "s";
+          s.textContent = c.st === "ok" ? "✓" : c.st === "no" ? "✕" : c.st === "replay" ? "↺" : "–";
+          const n = document.createElement("span");
+          n.textContent = c.name + (c.st === "skip" ? " (not reached)" : c.st === "replay" ? " — already decided, replaying it" : "");
+          row.append(s, n); ul.append(row);
+          if (c.st !== "skip") await wait(260);
+        }
+        verdict.replaceChildren(result.ok
+          ? badge(true, "Executed")
+          : badge(false, "Rejected"), document.createTextNode(result.ok ? "  " + (result.note || "Sell executed, confirmation SMS sent back.") : "  " + result.reason));
+      },
+    };
+  }
+  function badge(ok, text) {
+    const s = document.createElement("span"); s.className = "badge " + (ok ? "ok" : "no");
+    const b = document.createElement("b"); b.textContent = ok ? "✓" : "✕";
+    s.append(b, text); return s;
+  }
+
+  // ---- Dashboard pane ----
+  function setValue(node, text) {
+    text = String(text);
+    if (node.textContent === text) return;
+    node.textContent = text;
+    if (S.firstRender) return;
+    node.classList.remove("bump"); void node.offsetWidth; node.classList.add("bump");
+  }
+  function cell(text, cls) { const td = document.createElement("td"); if (cls) td.className = cls; if (text instanceof Node) td.append(text); else td.textContent = text; return td; }
+  let seenOrders = new Set(), seenRej = new Set();
+  function renderDash() {
+    const value = S.holdings.reduce((s, h) => s + h.qty * h.price, 0);
+    const startValue = START.reduce((s, h) => s + h.qty * h.price, 0);
+    setValue($("kValue"), inr0.format(value));
+    $("kValueNote").textContent = startValue - value > 0.005 ? inr0.format(startValue - value) + " sold since reset" : "Nothing sold yet";
+    setValue($("kFilled"), S.orders.length);
+    $("kFilledNote").textContent = S.orders[0] ? "Latest at " + hhmmss(S.orders[0].at) : "Waiting for the first order";
+    setValue($("kSms"), S.orders.filter((o) => o.channel === "SMS").length);
+    setValue($("kRej"), S.rejections.length);
+
+    const body = $("holdings");
+    if (body.children.length !== S.holdings.length) {
+      body.replaceChildren(...S.holdings.map((h) => {
+        const tr = document.createElement("tr"); tr.dataset.s = h.symbol;
+        const strong = document.createElement("strong"); strong.textContent = h.symbol;
+        const qtyCell = document.createElement("td");
+        const q = document.createElement("span"); q.className = "q";
+        const m = document.createElement("div"); m.className = "meter"; m.append(document.createElement("i"));
+        qtyCell.append(q, m);
+        tr.append(cell(strong), qtyCell, cell("", "num lim"), cell("", "num pr"), cell("", "num val"));
+        return tr;
+      }));
+    }
+    for (const tr of body.children) {
+      const h = holding(tr.dataset.s), from = START.find((x) => x.symbol === h.symbol).qty;
+      setValue(tr.querySelector(".q"), `${h.qty} of ${from}`);
+      tr.querySelector(".meter i").style.width = (from ? (h.qty / from) * 100 : 0) + "%";
+      tr.querySelector(".lim").textContent = h.limit;
+      tr.querySelector(".pr").textContent = inr.format(h.price);
+      tr.querySelector(".val").textContent = inr.format(h.qty * h.price);
+    }
+
+    const chan = (c) => { const s = document.createElement("span"); s.className = "chan" + (c === "SMS" ? " sms" : ""); s.textContent = c; return s; };
+    const empty = (cols, text) => { const tr = document.createElement("tr"); tr.className = "empty"; const td = cell(text); td.colSpan = cols; tr.append(td); return tr; };
+    $("orders").replaceChildren(...(S.orders.length ? S.orders.map((o) => {
+      const tr = document.createElement("tr");
+      if (!S.firstRender && !seenOrders.has(o.txId)) tr.className = "fresh";
+      const strong = document.createElement("strong"); strong.textContent = o.symbol;
+      tr.append(cell(hhmmss(o.at)), cell(badge(true, "Filled")), cell(strong), cell(o.qty, "num"), cell(inr.format(o.price), "num"), cell(inr.format(o.proceeds), "num"), cell(chan(o.channel)), cell(o.txId, "mono"));
+      return tr;
+    }) : [empty(8, "No orders yet. Place an emergency sell from the phone.")]));
+    $("rejections").replaceChildren(...(S.rejections.length ? S.rejections.map((r) => {
+      const tr = document.createElement("tr");
+      if (!S.firstRender && !seenRej.has(r.id)) tr.className = "fresh";
+      tr.append(cell(hhmmss(r.at)), cell(badge(false, "Rejected")), cell(r.reason, "wrap"), cell(r.from, "mono"));
+      return tr;
+    }) : [empty(4, "Nothing rejected. Use the buttons in the middle pane to try.")]));
+    seenOrders = new Set(S.orders.map((o) => o.txId));
+    seenRej = new Set(S.rejections.map((r) => r.id));
+    for (const id of ["replayBtn", "conflictBtn"]) {
+      $(id).disabled = !S.lastGood;
+      $(id).title = S.lastGood ? "" : "Send an emergency sell over SMS first";
+    }
+    S.firstRender = false;
+  }
+
+  // ---- Phone pane ----
+  const el = (tag, attrs = {}, ...kids) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === "class") n.className = v; else if (k === "on") n.addEventListener("click", v);
+      else if (k === "disabled") n.disabled = v; else n.setAttribute(k, v);
+    }
+    for (const k of kids) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+    return n;
+  };
+  function go(screen) { S.screen = screen; renderPhone(); }
+  function renderPhone() {
+    const app = $("app");
+    const online = S.data;
+    let view;
+    if (S.screen === "home") {
+      const total = S.holdings.reduce((s, h) => s + h.qty * h.price, 0);
+      view = [
+        el("div", { class: "app-row" }, el("h3", {}, "TradeRescue"), el("span", { class: "pill " + (online ? "on" : "off") }, el("i"), online ? "Online" : "Offline")),
+        el("div", { class: "muted", style: "margin-top:14px;font-size:12px" }, "Portfolio value"),
+        el("div", { class: "big" }, inr0.format(total)),
+        el("div", { style: "margin:8px 0 6px" }, ...S.holdings.map((h) => el("div", { class: "hold" },
+          el("div", {}, el("b", {}, h.symbol), el("small", {}, `${h.qty} shares`)),
+          el("div", { style: "text-align:right" }, inr.format(h.price), el("small", { class: h.chg >= 0 ? "up" : "down" }, (h.chg >= 0 ? "▲ " : "▼ ") + Math.abs(h.chg).toFixed(1) + "%"))))),
+        el("div", { class: "grow" }),
+        el("button", { class: "app-btn", on: () => go("select") }, "🚨 Emergency Sell"),
+        el("div", { class: "muted center", style: "font-size:12px;margin-top:8px" }, online ? "Online now. Turn mobile data off to rehearse an outage." : "Data is down. Orders go out as a signed SMS."),
+      ];
+    } else if (S.screen === "select") {
+      view = [
+        el("button", { class: "back", on: () => go("home") }, "‹ Back"),
+        el("h3", {}, "What do you need to sell?"),
+        el("p", { class: "muted", style: "font-size:12px;margin:4px 0 12px" }, "Each holding has a pre-authorized emergency limit."),
+        ...S.holdings.map((h) => el("button", { class: "pick", disabled: cap(h) < 1, on: () => { S.sel = h.symbol; S.qty = 1; go("qty"); } },
+          el("span", {}, el("b", {}, h.symbol), el("small", { class: "muted", style: "display:block;font-size:12px" }, cap(h) ? `Authorized up to ${cap(h)} shares` : "Nothing left to sell")),
+          inr.format(h.price))),
+      ];
+    } else if (S.screen === "qty") {
+      const h = holding(S.sel), max = cap(h);
+      view = [
+        el("button", { class: "back", on: () => go("select") }, "‹ Back"),
+        el("div", { class: "center muted" }, h.symbol),
+        el("div", { class: "qty" }, S.qty),
+        el("div", { class: "steppers" },
+          el("button", { class: "round", disabled: S.qty <= 1, "aria-label": "One less", on: () => { S.qty--; renderPhone(); } }, "–"),
+          el("button", { class: "round", disabled: S.qty >= max, "aria-label": "One more", on: () => { S.qty++; renderPhone(); } }, "+")),
+        el("div", { class: "center muted", style: "font-size:12px;margin-bottom:12px" }, `Max ${max} shares authorized for emergency sell`),
+        el("div", { class: "box" }, el("div", { class: "muted", style: "font-size:12px" }, "Estimated proceeds"), el("div", { style: "font-size:20px;font-weight:600" }, inr.format(S.qty * h.price)),
+          el("div", { style: "font-size:12px;margin-top:2px;color:" + (online ? "var(--app-green)" : "var(--app-amber)") }, online ? "Will go over the direct connection" : "Will go over the emergency SMS channel")),
+        el("div", { class: "grow" }),
+        el("button", { class: "app-btn", on: () => { S.pin = ""; S.pinErr = ""; go("pin"); } }, "Confirm Emergency Sell"),
+      ];
+    } else if (S.screen === "pin") {
+      const key = (d) => el("button", { class: "key", on: () => pressPin(d) }, d);
+      view = [
+        el("button", { class: "back", on: () => go("qty") }, "‹ Back"),
+        el("h3", { class: "center" }, "Confirm it's you"),
+        el("div", { class: "center muted", style: "font-size:12px;margin-top:4px" }, "Enter your PIN to authorize this sell"),
+        el("div", { class: "dots" }, ...[0, 1, 2, 3].map((i) => el("i", { class: i < S.pin.length ? "f" : "" }))),
+        el("div", { class: "err" }, S.pinErr),
+        el("div", { class: "grow" }),
+        el("div", { class: "keys" }, ...[1, 2, 3, 4, 5, 6, 7, 8, 9].map(key), el("span"), key(0),
+          el("button", { class: "key", "aria-label": "Delete", on: () => { S.pin = S.pin.slice(0, -1); renderPhone(); } }, "⌫")),
+        el("div", { class: "center muted", style: "font-size:12px;margin-top:12px" }, "Demo PIN: 1234"),
+      ];
+    } else if (S.screen === "exec") {
+      view = [
+        el("h3", {}, "Executing"),
+        el("div", { style: "margin-top:12px" }, ...S.steps.map((s) => el("div", { class: "step" }, el("span", { class: "ok" }, "✓"), s))),
+        S.busy ? el("div", { class: "step muted" }, el("span", { class: "spin" }), "Working…") : "",
+        S.packet ? el("div", { class: "pkt" }, el("small", {}, `Signed packet · ${S.packet.length} of 160 SMS characters`), el("code", {}, S.packet)) : "",
+      ];
+    } else if (S.screen === "done") {
+      const r = S.result;
+      view = [
+        el("div", { class: "grow" }),
+        el("div", { class: "tick", style: "background:" + (r.confirmed ? "var(--app-green)" : "var(--app-amber)") }, "✓"),
+        el("h3", { class: "center" }, r.confirmed ? "Order executed" : "Order sent"),
+        el("p", { class: "center muted", style: "font-size:13px" }, r.text),
+        r.packet ? el("div", { class: "pkt" }, el("small", {}, "Signed packet"), el("code", {}, r.packet)) : "",
+        el("div", { class: "grow" }),
+        el("button", { class: "app-btn ghost", on: () => { S.sel = null; go("home"); } }, "Done"),
+      ];
+    }
+    app.replaceChildren(...view.filter((v) => v !== ""));
+    app.scrollTop = 0;
+  }
+
+  function pressPin(d) {
+    if (S.pin.length >= 4) return;
+    S.pin += d;
+    if (S.pin.length === 4) {
+      if (S.pin === PIN) { execute(); return; }
+      S.pin = ""; S.pinErr = "Incorrect PIN, try again";
+    }
+    renderPhone();
+  }
+  const step = async (text, ms = 550) => { S.steps.push(text); renderPhone(); await wait(ms); };
+
+  async function execute() {
+    const h = holding(S.sel), qty = S.qty, online = S.data;
+    S.steps = []; S.packet = null; S.busy = true; go("exec");
+    if (online) {
+      await step("Sending order over HTTPS", 300);
+      await travel("web", "Sending the order over the internet (HTTPS)…");
+      h.qty -= qty;
+      const txId = "TRX" + randomHex(3).toUpperCase();
+      S.orders.unshift({ txId, symbol: h.symbol, qty, price: h.price, proceeds: Math.round(qty * h.price * 100) / 100, channel: "Internet", at: new Date() });
+      const ev = addEvent(`Order via Internet · ${qty} ${h.symbol}`, null, {
+        ok: true, note: "Normal online order.",
+        checks: [{ name: "Logged-in session over HTTPS", st: "ok" }, { name: "Enough shares held", st: "ok" }],
+      });
+      await ev.play();
+      route("web", 3, "Delivered over the internet. Turn mobile data off to see the emergency path.");
+      renderDash();
+      S.busy = false;
+      S.result = { confirmed: true, text: `Sold ${qty} shares of ${h.symbol} at ${inr.format(h.price)} — proceeds ${inr.format(qty * h.price)}, via the direct connection.` };
+      go("done");
+      return;
+    }
+    await step("No data connection — switching to the emergency channel");
+    const wire = await buildPacket(h.symbol, qty);
+    S.packet = wire;
+    await step(`Packet built & signed with HMAC-SHA256 (${wire.length} characters)`);
+    await step("Handing the packet to the cellular radio", 450);
+    await travel("sms", "SMS on its way: phone → mobile network → gateway → server…");
+    await step("SMS accepted by the network", 200);
+    const result = await serverReceive(wire, ME);
+    if (result.ok) S.lastGood = wire;
+    const ev = addEvent(`SMS from ${ME} · ${qty} ${h.symbol}`, wire, result);
+    await ev.play();
+    renderDash();
+    route("sms", 3, result.ok ? "Executed. Confirmation SMS going back to the phone…" : "Rejected: " + result.reason);
+    S.busy = false;
+    S.result = { confirmed: false, packet: wire, text: `Sell ${qty} shares of ${h.symbol} went out via the emergency SMS channel. The broker confirms the fill by SMS.` };
+    go("done");
+    await wait(1300);
+    toast(result.reply);
+  }
+
+  let toastTimer = null;
+  function toast(text) {
+    $("toastText").textContent = text;
+    $("toastTime").textContent = hhmmss().slice(0, 5);
+    $("toast").classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => $("toast").classList.remove("show"), 9000);
+  }
+  $("toast").addEventListener("click", () => $("toast").classList.remove("show"));
+
+  // ---- Packets sent straight to the server ----
+  //
+  // Four of these are hostile. "Resend the same SMS" is not: it is the
+  // exactly-once guarantee being demonstrated, which is why it is the one
+  // button here that ends in a fill rather than a refusal.
+  const ATTACKER = "+91 70••• ••999";
+  async function attack(kind) {
+    let wire, title, hostile = true, flight = "Hostile SMS on its way to the server…";
+    if (kind === "tamper") {
+      const base = S.lastGood || await buildPacket("TCS", 3);
+      const p = base.split("|"); p[5] = "9"; wire = p.join("|");
+      title = "Forged packet: quantity changed after signing";
+    } else if (kind === "replay") {
+      if (!S.lastGood) return;
+      wire = S.lastGood;
+      hostile = false;
+      title = "The same SMS again (duplicate delivery)";
+      flight = "A duplicate of an order already received…";
+    } else if (kind === "conflict") {
+      if (!S.lastGood) return;
+      // Same tx_id, a different order, signed correctly: what a replay
+      // would look like if an attacker could also sign. The hash on the
+      // ledger does not match, so it is a conflict and never executes.
+      const p = S.lastGood.split("|");
+      const qty = String(Number(p[5]) + 4);
+      wire = await buildPacket(p[4], qty, { txId: p[1] });
+      title = `Same tx_id as the last order, but for ${qty} shares`;
+    } else if (kind === "expired") {
+      wire = await buildPacket("INFY", 2, { tsOffset: -20 * 60 });
+      title = "Packet signed 20 minutes ago";
+    } else {
+      wire = await buildPacket("HDFCBANK", 30);
+      title = "Sell 30 HDFCBANK (limit 25)";
+    }
+    document.querySelectorAll(".attack").forEach((b) => (b.disabled = true));
+    const before = holding(S.lastGood ? S.lastGood.split("|")[4] : "TCS");
+    const qtyBefore = before ? before.qty : null;
+    await travel("sms", flight);
+    const result = await serverReceive(wire, hostile ? ATTACKER : ME);
+    const ev = addEvent(title, wire, result);
+    await ev.play();
+    let note;
+    if (result.replayed) {
+      const unchanged = before && before.qty === qtyBefore;
+      note = "Exactly-once: duplicate returned the original result" +
+        (unchanged ? ", holding unchanged." : ".");
+    } else {
+      note = result.ok ? "Accepted." : "Rejected: " + result.reason + ". Nothing was sold.";
+    }
+    route("sms", 3, note);
+    renderDash();
+    document.querySelectorAll(".attack").forEach((b) => (b.disabled = false));
+    renderDash();
+  }
+  document.querySelectorAll(".attack").forEach((b) => b.addEventListener("click", () => attack(b.dataset.attack)));
+
+  // ---- Controls ----
+  function setData(on) {
+    S.data = on;
+    $("dataToggle").setAttribute("aria-checked", String(on));
+    $("dataNote").textContent = on ? "On. Orders go over the internet." : "Off. Only the mobile signal (SMS) is left.";
+    $("netBadge").textContent = on ? "4G" : "4G";
+    $("netBadge").classList.toggle("off", !on);
+    $("guide").children[0].classList.toggle("done", !on);
+    if (!S.busy && (S.screen === "home" || S.screen === "qty")) renderPhone();
+  }
+  $("dataToggle").addEventListener("click", () => setData(!S.data));
+  $("reset").addEventListener("click", reset);
+  function reset() {
+    fresh();
+    seenOrders = new Set(); seenRej = new Set();
+    $("feed").replaceChildren(Object.assign(document.createElement("li"), { className: "feed-empty", textContent: "No packets yet. Each order and each attack appears here with its checks." }));
+    $("toast").classList.remove("show");
+    route("sms", -1, "Waiting for an order.");
+    setData(true);
+    renderPhone(); renderDash();
+  }
+  setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", hour12: false }); }, 1000);
+  reset();
+})();
+</script>
+
+</body>
+</html>
