@@ -11,6 +11,7 @@ android {
         applicationId = "com.traderescue.app"
         minSdk = 26
         targetSdk = 34
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 1
         versionName = "1.0"
     }
@@ -69,4 +70,10 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
 
     testImplementation("junit:junit:4.13.2")
+
+    // Instrumented tests for the Android Keystore path, which a JVM test
+    // cannot reach. Run with :app:connectedDebugAndroidTest on a device or
+    // emulator; see docs/manual-test.md.
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

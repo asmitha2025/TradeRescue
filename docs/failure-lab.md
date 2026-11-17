@@ -13,14 +13,14 @@ broker.** No packet crosses a radio and no transaction reaches Google.
 
 |  |  |
 |---|---|
-| Commit | `83e0b49 (working tree dirty: 15 other file(s))` |
-| Date | 2026-11-17T09:42:11.575Z |
+| Commit | `b48da3e (working tree dirty: 15 other file(s))` |
+| Date | 2026-11-17T10:22:49.041Z |
 | Base seed | `20261117` |
 | Seeds run | `20261117`, `20269036`, `20276955`, `20284874`, `20292793` |
 | Packets per seed | 10,000 |
 | Packets total | 50,000 |
 | Deliveries total | 83,524 |
-| Runtime | 5.9s |
+| Runtime | 8.5s |
 | Node | v24.13.1 |
 
 ## Result
@@ -116,6 +116,12 @@ again, because they never became an order at all.
 | Replays served (no new decision) | 31,947 |
 | Stopped before the ledger (forged or conflicting) | 13,874 |
 | Packets dropped before arrival | 3,323 |
+
+The four groups partition the deliveries, so the arithmetic is checkable:
+
+```
+23,232 filled + 14,471 refused + 31,947 replayed + 13,874 pre-ledger = 83,524 deliveries
+```
 
 ## Reproducing
 

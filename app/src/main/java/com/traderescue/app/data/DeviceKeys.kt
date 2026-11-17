@@ -10,6 +10,7 @@ import android.security.keystore.StrongBoxUnavailableException
 import android.security.keystore.UserNotAuthenticatedException
 import androidx.annotation.RequiresApi
 import java.security.KeyStore
+import java.security.KeyStoreException
 import javax.crypto.Mac
 import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
@@ -169,9 +170,22 @@ class KeystoreDeviceKeys(context: Context) : DeviceKeys {
         store.setEntry(alias, entry, protection(requireAuth, strongBox = true))
         true
     } catch (e: StrongBoxUnavailableException) {
-        // Expected on plenty of hardware: StrongBox support for HMAC keys
-        // is patchy. The key still lands in the Keystore, just not in the
-        // secure element.
+        // The documented signal, thrown when GENERATING a key.
+        false
+    } catch (e: KeyStoreException) {
+        // The one that actually happens when IMPORTING one. A device with
+        // no secure element answers setEntry with a plain KeyStoreException
+        // ("Failed to import secret key", caused by HARDWARE_TYPE_UNAVAILABLE)
+        // and never throws StrongBoxUnavailableException at all.
+        //
+        // Catching only the documented exception meant enrollment threw on
+        // every device without StrongBox, which is most of them. The
+        // instrumented test on an emulator is what found it; no JVM test
+        // could have.
+        //
+        // Swallowing this is safe: the fallback import below runs next, and
+        // if that fails too its exception propagates, so a genuinely bad
+        // key is still reported.
         false
     }
 

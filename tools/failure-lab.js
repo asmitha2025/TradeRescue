@@ -866,6 +866,7 @@ function buildReport(runs, opts, elapsedMs) {
   const refused = allObs.filter((o) => o.refusedFresh).length;
   const replays = allObs.filter((o) => o.replayed).length;
   const preLedger = allObs.filter((o) => !o.filledFresh && !o.refusedFresh && !o.replayed).length;
+  const sum = filled + refused + replays + preLedger;
   lines.push("");
   lines.push("A **first-time decision** is a delivery the server decided and wrote to");
   lines.push("the ledger. Only the filled ones sold anything: the rest are terminal");
@@ -881,6 +882,16 @@ function buildReport(runs, opts, elapsedMs) {
     ["Stopped before the ledger (forged or conflicting)", preLedger.toLocaleString("en-US")],
     ["Packets dropped before arrival", allPlans.filter((p) => p.fault === "drop").length.toLocaleString("en-US")],
   ]));
+  lines.push("");
+  lines.push("The four groups partition the deliveries, so the arithmetic is checkable:");
+  lines.push("");
+  lines.push("```");
+  lines.push(
+    `${filled.toLocaleString("en-US")} filled + ${refused.toLocaleString("en-US")} refused + ` +
+    `${replays.toLocaleString("en-US")} replayed + ${preLedger.toLocaleString("en-US")} pre-ledger ` +
+    `= ${sum.toLocaleString("en-US")} deliveries`,
+  );
+  lines.push("```");
   lines.push("");
   lines.push("## Reproducing");
   lines.push("");
@@ -933,11 +944,12 @@ async function main() {
     runs.push(run);
 
     const bad = run.invariants.filter((i) => !i.pass).length + run.boundaries.filter((b) => !b.pass).length;
-    const n = (predicate) => run.observations.filter(predicate).length.toLocaleString("en-US");
-    say(`  seed ${seed}: ${run.observations.length.toLocaleString("en-US")} deliveries — ` +
-      `${n((o) => o.filledFresh)} filled, ` +
-      `${n((o) => o.refusedFresh)} refused, ` +
-      `${n((o) => o.replayed)} replayed — ` +
+    const count = (predicate) => run.observations.filter(predicate).length;
+    const n = (predicate) => count(predicate).toLocaleString("en-US");
+    const preLedger = (o) => !o.filledFresh && !o.refusedFresh && !o.replayed;
+    say(`  seed ${seed}: ${n((o) => o.filledFresh)} filled + ${n((o) => o.refusedFresh)} refused + ` +
+      `${n((o) => o.replayed)} replayed + ${n(preLedger)} pre-ledger = ` +
+      `${run.observations.length.toLocaleString("en-US")} deliveries — ` +
       (bad === 0 ? "all invariants held" : `${bad} FAILURE(S)`));
   }
 
@@ -947,10 +959,32 @@ async function main() {
   fs.writeFileSync(opts.report, report.endsWith("\n") ? report : report + "\n", "utf8");
   say(`\nReport written to ${path.relative(process.cwd(), opts.report)}`);
 
-  const failures = runs.flatMap((r) => [
+  // Accounting, not security, but a report whose numbers do not add up is
+  // not evidence of anything either. Every delivery lands in exactly one
+  // group, and if that ever stops being true the run fails rather than
+  // quietly printing a total nobody can reconcile.
+  const accounting = [];
+  for (const run of runs) {
+    const o = run.observations;
+    const groups = o.filter((x) => x.filledFresh).length +
+      o.filter((x) => x.refusedFresh).length +
+      o.filter((x) => x.replayed).length +
+      o.filter((x) => !x.filledFresh && !x.refusedFresh && !x.replayed).length;
+    if (groups !== o.length) {
+      accounting.push(`seed ${run.seed}: decision groups sum to ${groups}, but there were ${o.length} deliveries`);
+    }
+    // The groups must also be mutually exclusive, which the sum alone
+    // would not catch if two of them double-counted and a third lost one.
+    const overlapping = o.filter((x) => [x.filledFresh, x.refusedFresh, x.replayed].filter(Boolean).length > 1);
+    if (overlapping.length) {
+      accounting.push(`seed ${run.seed}: ${overlapping.length} delivery(s) counted in more than one group`);
+    }
+  }
+
+  const failures = accounting.concat(runs.flatMap((r) => [
     ...r.invariants.filter((i) => !i.pass).map((i) => `seed ${r.seed}: ${i.name} (${i.count})`),
     ...r.boundaries.filter((b) => !b.pass).map((b) => `seed ${r.seed}: boundary "${b.name}" gave ${b.actual}, expected ${b.expect}`),
-  ]);
+  ]));
 
   if (failures.length) {
     console.error(`\nFAILED: ${failures.length} problem(s)`);

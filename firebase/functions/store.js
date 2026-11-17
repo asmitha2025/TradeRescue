@@ -25,6 +25,33 @@ const HISTORY_COLLECTIONS = ["orders", "rejections", "nonces"];
 
 const millis = (ts) => (ts && ts.toMillis ? ts.toMillis() : null);
 
+/** How many times a transaction may be retried for a transient failure. */
+const TRANSACTION_ATTEMPTS = 5;
+
+/**
+ * gRPC status codes worth retrying. A transient failure says nothing about
+ * whether the request was valid, so a retry is allowed to reach a
+ * different answer; everything else is a real result and is passed up.
+ */
+const TRANSIENT_CODES = new Set([
+  4,  // DEADLINE_EXCEEDED
+  10, // ABORTED -- contention Firestore's own retries did not absorb
+  13, // INTERNAL
+  14, // UNAVAILABLE
+]);
+
+function isTransient(error) {
+  if (!error) return false;
+  // Our own refusals carry a string code ("TXID_CONFLICT", "EXPIRED").
+  // They are decisions, not failures, and retrying one would be wrong.
+  if (typeof error.code === "string") return false;
+  if (TRANSIENT_CODES.has(error.code)) return true;
+  // The Node SDK reports a transaction closed under contention as
+  // INVALID_ARGUMENT, which is otherwise a permanent error -- the message
+  // is the only thing that tells the two apart.
+  return error.code === 3 && /transaction is invalid or closed/i.test(String(error.message));
+}
+
 /**
  * The real thing. `db` is injected rather than imported so this module
  * pulls in no firebase-admin of its own and stays requirable from a test.
@@ -45,7 +72,43 @@ class FirestoreStore {
    * runs between the reads and the writes of a Firestore transaction,
    * which may be retried on contention.
    */
-  async withOrderTransaction({ userId, txId }, apply) {
+  /**
+   * Retries a transaction that failed for a reason that is nobody's fault.
+   *
+   * Firestore retries on contention by itself, but under a burst of
+   * transactions on the same documents the Node SDK can still surface
+   * "Transaction is invalid or closed", and a stressed backend can answer
+   * UNAVAILABLE or DEADLINE_EXCEEDED. The Firestore emulator smoke test
+   * found this: with ten duplicate copies of one packet racing, roughly
+   * one trial in eight had a single copy fail this way.
+   *
+   * Exactly-once held throughout -- only ever one fill, which is the
+   * property that matters -- so this is an availability problem, not a
+   * safety one: one caller got an error where it should have got its
+   * replay. Retrying is safe precisely because the operation is keyed on
+   * tx_id and idempotent: a retry either does the work or reads the record
+   * the winner wrote and replays it.
+   *
+   * A refusal from our own logic is NOT transient and is never retried.
+   */
+  async withOrderTransaction(keys, apply) {
+    let lastError;
+    for (let attempt = 0; attempt < TRANSACTION_ATTEMPTS; attempt++) {
+      try {
+        return await this.attemptOrderTransaction(keys, apply);
+      } catch (e) {
+        if (!isTransient(e)) throw e;
+        lastError = e;
+        // Jittered backoff, so copies that collided do not collide again
+        // in lockstep.
+        const backoff = 25 * 2 ** attempt + Math.floor(Math.random() * 25);
+        await new Promise((resolve) => setTimeout(resolve, backoff));
+      }
+    }
+    throw lastError;
+  }
+
+  async attemptOrderTransaction({ userId, txId }, apply) {
     const userRef = this.db.collection("users").doc(userId);
     const orderRef = this.db.collection("orders").doc(txId);
 

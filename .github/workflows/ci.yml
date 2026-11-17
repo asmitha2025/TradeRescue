@@ -28,6 +28,25 @@ jobs:
       - name: Demo page checks
         run: node demo/check-demo.js
 
+      # The unit tests above prove exactly-once on MemoryStore, which models
+      # a Firestore transaction but is not one. This runs the scenarios that
+      # actually depend on the store against the real Admin SDK and the
+      # Firestore emulator, which needs a JVM.
+      - name: Set up Java for the Firestore emulator
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Install the Firebase CLI
+        run: npm install --global firebase-tools@15
+
+      - name: Firestore emulator smoke test
+        working-directory: firebase
+        run: >
+          firebase emulators:exec --only firestore --project traderescue-emulator
+          "node functions/emulator-test/firestore.smoke.js"
+
       # Before trusting the lab, confirm it still catches a broken service.
       # If this fails, the lab has a blind spot and its result below means
       # nothing -- so it runs first.

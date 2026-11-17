@@ -293,9 +293,12 @@ test("each refusal for a validly signed packet is stored and replayed verbatim",
     assert.strictEqual(again.replayed, true, `${code} retry should be flagged as a replay`);
     assert.strictEqual(first.replayed, undefined, `${code} first arrival is not a replay`);
 
-    // The retry did not add a second rejection log entry.
-    assert.strictEqual((await store.counts()).rejected, 1, `${code} logged once`);
-    assert.strictEqual((await store.counts()).filled, 0, `${code} filled nothing`);
+    // It is on the ledger as a refused order, and NOT in the rejections
+    // log: the two are disjoint so the admin totals can be added up.
+    const counts = await store.counts();
+    assert.strictEqual(counts.refused, 1, `${code} counted as one refused order`);
+    assert.strictEqual(counts.rejected, 0, `${code} must not also be logged as a rejection`);
+    assert.strictEqual(counts.filled, 0, `${code} filled nothing`);
     assert.strictEqual(await held(store), expected, `${code} sold nothing`);
   }
 });
@@ -368,8 +371,9 @@ test("ten concurrent copies of a refused packet all get the same refusal", async
     assert.strictEqual(s.reason.code, "BELOW_FLOOR");
   }
   assert.strictEqual(await held(store), 20, "nothing sold");
-  assert.strictEqual((await store.counts()).rejected, 1, "nine replays add no log entries");
-  assert.strictEqual((await store.counts()).refused, 1, "one terminal refusal, not ten");
+  const counts = await store.counts();
+  assert.strictEqual(counts.refused, 1, "one terminal refusal, not ten");
+  assert.strictEqual(counts.rejected, 0, "a refusal on the merits is not a rejection log entry");
 });
 
 test("concurrent packets with different tx_ids all execute", async () => {
@@ -579,9 +583,11 @@ test("a failing transaction does not wedge the queue behind it", async () => {
   assert.strictEqual(r.status, "FILLED");
 
   // Two ledger records, one filled: the refusal is terminal and kept, so
-  // `filled` has to mean filled rather than "has a record".
+  // `filled` has to mean filled rather than "has a record". And nothing is
+  // in the rejections log, because neither packet was stopped before the
+  // ledger.
   const counts = await store.counts();
-  assert.deepStrictEqual(counts, { orders: 2, filled: 1, via_sms: 2, rejected: 1, refused: 1 });
+  assert.deepStrictEqual(counts, { orders: 2, filled: 1, via_sms: 2, rejected: 0, refused: 1 });
 });
 
 test("OrderError carries the status and code the layers above it rely on", () => {

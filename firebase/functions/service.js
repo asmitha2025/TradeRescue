@@ -24,10 +24,17 @@ const ORDER_TYPE_IOC = "I";
 const KEY_ROTATION_GRACE_SECONDS = MAX_VALIDITY_SECONDS;
 
 /**
- * Failures that happen before a device has been identified and vouched for.
- * None of these may claim a tx_id or leave a ledger record: they get a
- * rejection log entry and nothing else, so an attacker cannot burn a tx_id
- * the real device is about to use.
+ * Failures that stop a packet before it becomes an order.
+ *
+ * None of these may claim a tx_id or leave a ledger record, so an attacker
+ * cannot burn a tx_id the real device is about to use. The rejections log
+ * exists for exactly these, and for nothing else: a packet refused on the
+ * merits (expired, over limit, below floor) is an order with a terminal
+ * outcome and lives on the ledger instead.
+ *
+ * Keeping the two disjoint is what lets the dashboard add them up. They
+ * were not disjoint until the Firestore emulator smoke test noticed that a
+ * single below-floor packet was being counted twice.
  */
 const PRE_LEDGER_CODES = new Set([
   "BAD_FORMAT", "UNKNOWN_KEY", "REVOKED_KEY", "ROTATED_KEY",
@@ -200,12 +207,14 @@ class TradeRescue {
 
     // A validly signed packet that could not execute. The refusal is
     // stored and terminal, carrying the status it was first answered with
-    // so a replay reconstructs the identical error. Only the first arrival
-    // is logged, or a retry loop would inflate the rejection count itself.
+    // so a replay reconstructs the identical error.
+    //
+    // Deliberately NOT written to the rejections log: it is already on the
+    // ledger with its own status, and logging it in both places made the
+    // dashboard count one refused order as two.
     const error = new OrderError(outcome.http_status, outcome.message, outcome.status);
     error.at = outcome.at;
     if (outcome.replayed) error.replayed = true;
-    else await this.recordRejection(error, wire, channel, from);
     throw this.withDevice(error, device);
   }
 
@@ -420,10 +429,24 @@ class TradeRescue {
     return /^[A-Za-z0-9]{1,12}$/.test(parts[2] || "") ? parts[2] : "UNKNOWN";
   }
 
+  /**
+   * Logs a packet that never became an order.
+   *
+   * Refuses to log anything else, loudly. The rejections log and the
+   * ledger have to stay disjoint for the admin totals to mean anything,
+   * and a quiet double-count is exactly the bug this guard exists to stop
+   * coming back.
+   */
   async recordRejection(error, wire, channel, from) {
+    const code = error.code || "REFUSED";
+    if (!PRE_LEDGER_CODES.has(code)) {
+      throw new Error(
+        `${code} is a terminal outcome and belongs on the ledger, not in the rejections log`,
+      );
+    }
     await this.store.addRejection({
       reason: error.message,
-      code: error.code || "REFUSED",
+      code,
       channel,
       from: from || null,
       packet: String(wire || "").slice(0, 200),
