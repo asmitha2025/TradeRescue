@@ -1,15 +1,92 @@
-# TradeRescue — Android
+# TradeRescue
 
-When a trading app loses its data connection, you can't sell. TradeRescue
-adds an emergency channel: the order is packed into a compact, HMAC-signed
-packet (107 characters, and never more than 146) and sent as a real SMS
-over the cellular radio, which keeps working when mobile data and Wi-Fi
-don't. Orders expire if they arrive late, and the ledger is keyed so that
-one order executes at most once however many copies turn up.
+**A pre-authorized emergency exit for investors on unreliable networks:
+orders are armed online, triggered over SMS, expire if they arrive late,
+and are proven never to execute twice.**
 
-This is the native companion to `ui/index.html` in the main project. It
-exists for the one thing a web page cannot do: call Android's `SmsManager`
-directly.
+A trading app with no data connection cannot sell. TradeRescue adds a
+second channel: the order becomes a 116-character signed packet and goes
+out as a real SMS over the cellular radio, which survives a great deal that
+mobile data does not.
+
+> 📹 **Demo video:** _<!-- paste link here -->_
+
+---
+
+## The scenario
+
+Meena runs a small shop outside Nashik. Most of her savings are in three
+stocks. The market opens badly, and she needs out of one position before it
+gets worse.
+
+Her phone shows full signal and no data. The tower is congested, the
+monsoon has taken a backhaul link, and her broker's app sits on a spinner.
+By the time it loads, the price she wanted is gone.
+
+What she has is SMS. It needs far less of the network to work, and it keeps
+working when data does not.
+
+So TradeRescue sends the order as a text. That raises three problems, and
+the whole design is the answer to them:
+
+| Problem | Why it is hard | Answer |
+|---|---|---|
+| One SMS is 160 characters | A JSON order does not fit | A pipe-separated format with a per-field character budget |
+| SMS is unauthenticated | Anyone can text the number | HMAC signature from a key held in Meena's phone, released by her fingerprint |
+| SMS is store-and-forward | Copies arrive late, twice, or out of order | `tx_id` idempotency, and an expiry the server enforces |
+
+Meena resends the text because she never saw a confirmation. The second
+copy does not sell a second time — it returns the original fill. The
+confirmation that comes back is signed, so a text from anyone else claiming
+"SOLD" is shown as an unverified message and never as a sale.
+
+---
+
+## Results
+
+Everything below was produced by running the commands in this repo. No
+number here is written by hand.
+
+| | |
+|---|---|
+| Backend tests | **113** passing (`npm test` in `firebase/functions`) |
+| Firestore emulator scenarios | **8** passing, against real transactions |
+| Android unit tests | **26** passing |
+| Android instrumented tests | **14** passing, on a device |
+| Demo page checks | **36** passing |
+| Self-check mutations caught | **7 of 7** |
+| Lint | clean |
+
+**Failure lab** — 50,000 packets over 5 seeds, under drops, duplicates,
+concurrent duplicates, reordering, delays past expiry, tampering, `tx_id`
+conflicts, clock skew, and five key faults:
+
+```
+23,232 filled + 14,471 refused + 31,947 replayed + 13,874 pre-ledger = 83,524 deliveries
+```
+
+All **8 invariants** held on every seed, and every expiry boundary case
+matched. Full report: [docs/failure-lab.md](docs/failure-lab.md).
+
+The lab is only worth that much because `tools/lab-selfcheck.js` breaks the
+service seven ways on purpose and fails unless the matching check fires. A
+lab that cannot fail is not evidence.
+
+### Bugs that testing found
+
+Each of these was live in code that looked correct and had passing tests:
+
+| Bug | Found by |
+|---|---|
+| The shape regexes permitted a 190-character packet, so the one-segment guarantee rested on convention | a worst-case Kotlin test |
+| `SmsGatewayReceiver` filtered on the old version prefix and would have silently dropped every packet | a grep after a version bump |
+| The response sub-key was serialised into the HTTP fallback's JSON, handing any caller what it needs to forge confirmations | writing a test that the outcome carries no key material |
+| A replayed confirmation was stamped with the send time, so a retry produced a second signed message attesting a new time for an old event | a replay test comparing bytes |
+| The dashboard double-counted refused orders | the Firestore emulator suite |
+| One duplicate in eight failed with `INVALID_ARGUMENT` instead of its replay, under contention | a contention probe against the emulator |
+| **The StrongBox fallback never worked**, so enrollment crashed on every device without a secure element | instrumented tests on a real emulator |
+| A self-check mutation had gone stale and was silently testing nothing | the self-check's own control run |
+| Six invariants all passed while one order's result was handed to a *different* order reusing its `tx_id` | the self-check's `conflict-as-replay` mutation |
 
 ## Try it without a phone
 
@@ -121,6 +198,45 @@ that trust and are out of scope: an ECDSA P-256 signature is 128 hex
 characters, which pushes the packet to roughly 204 and breaks the
 one-segment guarantee. Noted as future work.
 
+### Enrolling a device
+
+A device has to be enrolled before it can sign anything, and enrollment
+needs the network — which is the point of doing it ahead of time. A phone
+that has never enrolled cannot sign an emergency order, and the moment it
+needs one is exactly when it cannot enroll.
+
+Enrollment requires **two** things, and neither is a constant in source:
+
+1. **A signed-in session.** A Firebase Auth ID token, verified with
+   `checkRevoked` so signing out stops it working at once. The trading
+   account id comes from a custom claim rather than from the caller: a
+   Firebase uid is 28 characters and the packet's `user_id` field allows
+   12, so a session without a valid claim is refused outright rather than
+   truncated into somebody else's portfolio.
+2. **A one-time code.** Six digits, minted by an already signed-in
+   session, valid ten minutes, single use, stored only as a SHA-256 hash
+   and spent atomically. The session says who is asking; the code says
+   *this particular device* was authorised by a human looking at a
+   signed-in screen.
+
+Requiring both means a leaked session cannot silently add a device, and a
+code is useless to anyone not signed in. A code that never existed, one
+already spent and one expired all get the same refusal, because telling
+them apart would tell an attacker which guesses landed.
+
+**Three active devices per account.** Rotated and revoked keys do not
+occupy a slot, so rotation costs nothing and revoking frees one. Past the
+limit, enrollment is refused with instructions rather than silently.
+
+Every event — code issued, device enrolled, rotated, revoked, and each
+refusal with its reason — is written to an audit log naming who did it. The
+log holds no secrets and no code hashes, and a demo reset does not sweep it.
+
+A service built without an authenticator refuses every key-lifecycle
+request rather than waving them through. Failing closed is the only safe
+default for the operation that creates signing keys, and there is a test
+that it does.
+
 ### Revocation and rotation
 
 Both online only.
@@ -213,11 +329,34 @@ URL is set in the app, the dashboard shows the server's holdings.
 Requirements: Android Studio (Koala or newer) or just its bundled JDK plus
 the Android SDK. Min SDK 26.
 
+**The app:**
+
 ```
-gradlew.bat :app:assembleDebug        # APK in app/build/outputs/apk/debug/
-gradlew.bat :app:testDebugUnitTest    # packet + signing tests
-gradlew.bat :app:installDebug         # onto a connected phone/emulator
+gradlew.bat :app:assembleDebug             # APK in app/build/outputs/apk/debug/
+gradlew.bat :app:installDebug              # onto a connected phone/emulator
+gradlew.bat :app:testDebugUnitTest         # 26 JVM tests: format, HKDF, confirmations
+gradlew.bat :app:lintDebug
+gradlew.bat :app:connectedDebugAndroidTest # 14 Keystore tests, needs a device
 ```
+
+`connectedDebugAndroidTest` needs a **screen lock set** on the device or
+emulator (`adb shell locksettings set-pin 1234`): without one the Keystore
+cannot hold a key that requires user authentication, and the tests that
+check that requirement are meaningless.
+
+**The backend, the demo and the lab:**
+
+```
+cd firebase/functions && npm test          # 113 tests, no install needed
+node demo/check-demo.js                    # 36 checks on the demo page
+node tools/lab-selfcheck.js                # prove the lab still catches breakage
+node tools/failure-lab.js                  # 50,000 packets over 5 seeds
+cd firebase && npm --prefix functions run test:emulator   # 8 scenarios on real Firestore
+```
+
+Run `lab-selfcheck` **before** trusting `failure-lab`: if the self-check
+fails, the lab has a blind spot and its green result means nothing. The
+emulator test needs Java on the PATH.
 
 From a plain terminal, point `JAVA_HOME` at Android Studio's `jbr` folder
 and `ANDROID_HOME` at your SDK first. In Android Studio, just open the
@@ -231,6 +370,10 @@ folder and press Run.
   from a phone.
 - **SMS destination number** — where the emergency SMS goes (your Twilio
   number, so the backend's `/webhook/twilio-sms` receives it).
+- **Session token** and **Enrollment code** — the two credentials
+  enrollment needs. Neither is persisted: the token is a credential and the
+  code is single use. See "Enrolling a device" above for why the app asks
+  you to paste them rather than showing a sign-in screen.
 
 Both are saved across restarts. The same screen shows whether the data
 connection is up and whether SMS permission is granted.
@@ -261,14 +404,35 @@ app/src/main/java/com/traderescue/app/
 │   ├── Hkdf.kt            HKDF-SHA256 sub-key derivation
 │   ├── DeviceKeys.kt      Keystore-held per-device keys (+ memory fake)
 │   ├── Confirmation.kt    parses and verifies the server's signed reply
-│   ├── PacketSigner.kt    HMAC-SHA256
-│   ├── BackendApi.kt      OkHttp calls to /order and /emergency/sms
+│   ├── PacketSigner.kt    random material for packets
+│   ├── BackendApi.kt      OkHttp calls to /enroll, /order, /emergency/sms
+│   ├── SmsGatewayReceiver.kt  inbound SMS: confirmations and gateway mode
 │   └── SmsSender.kt       SmsManager call + sent-status confirmation
 └── ui/
-    ├── Theme.kt           same palette as ui/index.html
-    └── Screens.kt         all 7 screens, matching the web flow
-app/src/test/.../PacketTest.kt   wire format, signature vectors, SMS size
+    ├── Theme.kt           the shared palette
+    └── Screens.kt         every screen, including the four confidence states
+app/src/test/.../PacketTest.kt         26 JVM tests
+app/src/androidTest/.../KeystoreDeviceKeysTest.kt   14 on-device tests
+
+firebase/functions/
+├── packet.js        format, signature, confirmations — no I/O, no state
+├── keys.js          HKDF sub-key derivation
+├── auth.js          sessions: FirebaseSessionAuth | MemorySessionAuth
+├── engine.js        applying a sell to a holdings map — pure
+├── service.js       every decision, against the interfaces below
+├── store.js         FirestoreStore | MemoryStore
+├── keystore.js      SecretManagerKeyStore | MemoryKeyStore
+├── index.js         HTTP only: parse, call one method, shape the reply
+├── test/            113 unit tests
+└── emulator-test/   8 scenarios against real Firestore + a contention probe
+
+tools/
+├── failure-lab.js   50,000 packets through the real logic under fault injection
+└── lab-selfcheck.js breaks the service 7 ways and checks the lab notices
 ```
+
+Nothing below `index.js` imports firebase-admin, which is what lets the
+whole decision path run in a unit test with a virtual clock.
 
 ## Documentation
 
@@ -341,9 +505,10 @@ seed.
 ### Why the self-check exists
 
 A lab that cannot fail is not evidence. `tools/lab-selfcheck.js` breaks the
-service five ways on purpose — removing the tx_id lookup, ignoring expiry,
-trusting every signature, treating a conflicting tx_id as a replay, and
-accepting revoked and long-rotated keys — and
+service seven ways on purpose — removing the tx_id lookup, ignoring
+expiry, trusting every signature, treating a conflicting tx_id as a
+replay, accepting revoked and long-rotated keys, skipping the enrollment
+session check, and making enrollment codes reusable — and
 fails if the matching invariant does not fire. It also runs the unmutated
 code first and fails if the lab reports problems with healthy code.
 
@@ -365,7 +530,7 @@ first and fails if the lab is quiet when it should not be.
 
 Only what a test actually produced is claimed here.
 
-**Verified by tests that run in this repo** — 91 backend tests
+**Verified by tests that run in this repo** — 113 backend tests
 (`npm test` in `firebase/functions`), 8 Firestore emulator scenarios
 (`npm --prefix functions run test:emulator`), 26 Android unit tests
 (`gradlew.bat :app:testDebugUnitTest`), 14 instrumented Keystore tests
@@ -398,6 +563,12 @@ Only what a test actually produced is claimed here.
   one second after.
 - An outcome never serialises key material, so the HTTP fallback cannot
   hand a caller the key needed to forge confirmations.
+- Enrollment: an unauthenticated caller is refused; a replayed code is
+  refused; an expired code is refused and one at the last second of its
+  life still works; a code minted for another account is refused; three
+  devices racing one code produce exactly one enrollment; the device limit
+  holds and revoking frees a slot; one account cannot revoke or rotate
+  another's device; and a service with no authenticator refuses everything.
 - A confirmation verifies only against the right device's response sub-key:
   altered text, a wrong tag, a missing tag, another device's key and the
   request sub-key are each refused, and an unverifiable reply is never
@@ -478,8 +649,17 @@ keymaster — a real phone reports TEE or StrongBox) and
 - **No real broker is involved.** "Executes" means a row changes in a
   simulated ledger. Exactly-once is a property of **that ledger**; it says
   nothing about whether a real brokerage API would double-fill.
-- **The enrollment token is not authentication.** Anyone holding it can
-  enroll a device for any user id. Phase 4's login replaces it.
+- **The app has no sign-in screen.** The backend requires a real
+  Firebase Auth session and a one-time code, and that enforcement is
+  tested. What is missing is the Android side of it: wiring the Firebase
+  Auth SDK needs a configured project and a `google-services.json` this
+  repo does not carry, so Settings takes a pasted session token and the
+  six-digit code instead. The protocol is real; the way the app obtains
+  those two strings is not built.
+- **`FirebaseSessionAuth` has never run against the real Firebase Auth.**
+  Like `SecretManagerKeyStore`, it is written to the same interface as the
+  tested memory adapter, and the memory adapter is what every enrollment
+  test exercises.
 - The failure lab's numbers come from `MemoryStore`. The emulator suite is
   the cross-check against real Firestore, but it is eight scenarios, not
   fifty thousand packets.
@@ -487,13 +667,12 @@ keymaster — a real phone reports TEE or StrongBox) and
 
 ## Known limits (deliberate, for a demo)
 
-- The PIN is a constant in source, and so is the enrollment token. The
-  token is this demo's stand-in for the authenticated session a real
-  deployment would require before handing a device a key: **it is not
-  authentication**, and anyone holding it can enroll a device for any user.
-  Phase 4's login is what replaces it. The per-device signing keys
-  themselves are real — see "Per-device keys" above, including the part
-  about the server being able to forge them.
+- The PIN on the confirm screen is a constant in source. It is a
+  speed bump in front of the biometric prompt, not a credential; the thing
+  that actually authorises an order is the device key, released by a
+  fingerprint or the device credential. See "Per-device keys" above,
+  including the part about the server being able to forge a device's
+  packets.
 - On the SMS channel the app shows **Order sent**, not *executed*: the
   radio confirmed the message, but the fill is confirmed by the backend,
   which an offline phone can't hear from. Phase 3 closes that loop with a
