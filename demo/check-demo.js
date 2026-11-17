@@ -4,8 +4,9 @@
 // backend, not to test the DOM.
 const fs = require("fs");
 const vm = require("vm");
+const path = require("path");
 
-const html = fs.readFileSync("D:/projects/hari_projects/traderescue-android/demo/index.html", "utf8");
+const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 const m = html.match(/<script>\n([\s\S]*?)<\/script>/);
 if (!m) throw new Error("no script block found");
 let code = m[1];
