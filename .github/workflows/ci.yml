@@ -14,10 +14,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: firebase/functions/package-lock.json
 
-      # packet.js, engine.js, service.js and store.js have no dependencies
-      # of their own, so the tests, the demo check and the lab all run
-      # without an install. Only index.js needs firebase-admin.
+      # The unit tests, the demo check and the lab need no dependencies at
+      # all: packet.js, keys.js, auth.js, engine.js, service.js, store.js
+      # and keystore.js import nothing outside Node. The emulator smoke
+      # test is the exception -- it drives the real Admin SDK, so it needs
+      # firebase-admin, and node_modules is gitignored. Installing here
+      # rather than just before that step also means the unit tests run
+      # with dependencies present, which is closer to the deployed shape.
+      - name: Install backend dependencies
+        working-directory: firebase/functions
+        run: npm ci
+
       - name: Backend tests
         working-directory: firebase/functions
         run: npm test
