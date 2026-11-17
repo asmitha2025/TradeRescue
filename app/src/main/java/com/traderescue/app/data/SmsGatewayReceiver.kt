@@ -29,7 +29,10 @@ class SmsGatewayReceiver : BroadcastReceiver() {
         val parts = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
         val from = parts.firstOrNull()?.originatingAddress ?: return
         val text = parts.joinToString("") { it.messageBody.orEmpty() }.trim()
-        if (!text.startsWith("TRX|")) return
+        // Taken from the packet format rather than written out, so a
+        // version bump cannot leave the gateway silently dropping every
+        // real packet.
+        if (!text.startsWith("${EmergencyPacket.VERSION}|")) return
         // The receiver is registered twice (manifest, and by MainActivity
         // while the app is open), so the same SMS can arrive here twice.
         synchronized(handled) {

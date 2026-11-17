@@ -294,19 +294,30 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
                 log("No data connection — switching to the emergency channel")
                 delay(500)
-                val packet = EmergencyPacket.build(USER_ID, "S", holding.symbol, qty)
+                val packet = EmergencyPacket.build(
+                    USER_ID, "S", holding.symbol, qty,
+                    // No floor: exit at any price. A floor is the user's
+                    // choice, and the plans that let them set one arrive in
+                    // Phase 4 -- until then the honest default for an
+                    // emergency exit is to take the available price.
+                    floorPaise = 0,
+                )
                 val wire = packet.toWire(PacketSigner.hmacSha256Hex(SIGNING_SECRET, packet.signingPayload()))
                 wirePacket = wire
                 log("Packet built & signed with HMAC-SHA256 (${wire.length} characters)")
+                log("Valid for ${EmergencyPacket.DEFAULT_VALIDITY_SECONDS / 60} minutes, then the server refuses it")
                 delay(500)
 
                 val smsBlocker = SmsSender.unavailableReason(getApplication(), smsDestinationNumber)
                 when {
                     smsBlocker == null -> {
                         log("Handing the packet to the cellular radio")
-                        // The SMS is the order. It is deliberately NOT also
-                        // posted over HTTP: the backend would see the same
-                        // nonce twice and reject the second copy as a replay.
+                        // The SMS is the order, and it is not also posted
+                        // over HTTP -- not because a second copy would be
+                        // dangerous (the backend keys on tx_id and replays
+                        // the first outcome), but because one order should
+                        // cost one channel. Phase 5 adds deliberate fallback
+                        // across channels reusing this same tx_id.
                         SmsSender.send(getApplication(), smsDestinationNumber, wire)
                             .onSuccess {
                                 log("SMS accepted by the network → $smsDestinationNumber")

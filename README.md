@@ -2,12 +2,24 @@
 
 When a trading app loses its data connection, you can't sell. TradeRescue
 adds an emergency channel: the order is packed into a compact, HMAC-signed
-packet (about 85 characters) and sent as a real SMS over the cellular
-radio, which keeps working when mobile data and Wi-Fi don't.
+packet (107 characters, and never more than 146) and sent as a real SMS
+over the cellular radio, which keeps working when mobile data and Wi-Fi
+don't. Orders expire if they arrive late, and the ledger is keyed so that
+one order executes at most once however many copies turn up.
 
 This is the native companion to `ui/index.html` in the main project. It
 exists for the one thing a web page cannot do: call Android's `SmsManager`
 directly.
+
+## Try it without a phone
+
+[demo/index.html](demo/index.html) is a single-page interactive demo: the
+phone, the security engine and the admin dashboard side by side. Turn the
+phone's data off, sell, and watch the signed SMS get checked and land on
+the dashboard. It also has buttons that send tampered, replayed, expired
+and over-limit packets. Signing and every server check are the same as the
+real backend; the SMS hop and the exchange are simulated. Open the file in
+any browser, or publish the repo with GitHub Pages.
 
 ## How it works
 
@@ -17,18 +29,59 @@ Phone ──── HTTPS /order ────► Backend      Phone ── SMS �
                                            (signed packet)   /webhook/twilio-sms
 ```
 
-The packet, identical across the Android app, the web UI and `app/packet.py`:
+The packet (version 2), identical in the Android app's `Models.kt` and the
+backend's `packet.js`:
 
 ```
-TRX|tx_id|user_id|action|symbol|qty|order_type|nonce|timestamp|signature
-TRX|TRX0A1B2C|U10021|S|RELIANCE|5|M|deadbeef|1700000000|30727513722d65e08ca55805de554550
+TRX2|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+TRX2|TRX0A1B2C|U10021|S|RELIANCE|5|I|148000|1700001800|deadbeef|1700000000|bb983dacfcd5053a247949e396fd4dcf
 ```
 
-- `signature` is HMAC-SHA256 over the middle eight fields, truncated to 32
-  hex characters so the whole packet fits one SMS segment.
-- `nonce` and `timestamp` let the backend reject replays.
-- Each holding has a pre-authorized emergency limit; the app never lets you
-  queue more than that.
+- `signature` is HMAC-SHA256 over the eleven preceding fields, truncated to
+  32 hex characters. The version is field 0 and is signed, so a v1 `TRX`
+  packet cannot be relabelled as v2 — it fails the signature check.
+- `order_type` is `I`: immediate-or-cancel. The emergency path fills at the
+  available price or not at all. Nothing rests, because a resting order is
+  the wrong shape for an exit you need *now*.
+- `floor` is an optional price floor in **paise**, `0` meaning "exit at any
+  price". Integers keep the comparison off floating point on both sides.
+  The floor is the user's choice; no floor is the honest default for an
+  emergency exit, since a floor that does not fill is no exit at all.
+- `expires_at` is when the order stops being executable. It is the primary
+  protection against a late SMS. The server takes whichever comes first of
+  `expires_at` and `timestamp + 15 minutes`, so a packet cannot grant
+  itself a longer life than the server allows.
+- `timestamp` is now only a clock-skew backstop: a packet more than two
+  minutes in the future is refused.
+- `nonce` is signature entropy. It is no longer a replay guard — `tx_id` is
+  (see below).
+- Each holding has a pre-authorized emergency limit, enforced on the server
+  as well as in the app.
+
+### Exactly once
+
+`tx_id` is the idempotency key, and every field limit above is a character
+budget rather than a preference: the longest packet the server will accept
+is 146 characters, which is what keeps the one-segment guarantee a property
+of the format instead of a habit of the current client.
+
+1. **Signature first.** A forged or malformed packet produces a rejection
+   log entry and nothing else. It can never create or claim a `tx_id`, so
+   an attacker who learns a `tx_id` cannot burn it before the real device
+   uses it.
+2. **Then the `tx_id` lookup.** A `tx_id` already on the ledger replays its
+   stored outcome. Same `tx_id` with different bytes (matched on a SHA-256
+   of the packet) is a conflict, and gets an error rather than somebody
+   else's order.
+3. **Then expiry, limits and the floor.** Every outcome for a validly
+   signed packet is stored as terminal — filled, expired, below floor, over
+   limit — and replayed verbatim on a retry.
+4. **Then execution**, inside one transaction with the holdings update.
+
+Step 2 sitting before step 3 is the part that matters: a duplicate arriving
+a day late gets the **original fill**, not "expired". Ten copies of one
+packet racing each other produce one execution and nine identical
+replays.
 
 Channel selection, decided at the moment you enter your PIN:
 
@@ -63,7 +116,7 @@ folder and press Run.
 
 ## Settings (⚙ on the dashboard)
 
-- **Backend URL** — your deployed FastAPI backend. Empty means simulation
+- **Backend URL** — your deployed backend. Empty means simulation
   mode. Debug builds also accept plain `http://` so you can point at a
   laptop: `http://10.0.2.2:8000` from an emulator, or your laptop's LAN IP
   from a phone.
@@ -95,7 +148,7 @@ app/src/main/java/com/traderescue/app/
 ├── MainActivity.kt        entry point; requests SEND_SMS
 ├── AppViewModel.kt        screen state, connectivity, the execute() flow
 ├── data/
-│   ├── Models.kt          Holding, EmergencyPacket
+│   ├── Models.kt          Holding, EmergencyPacket (the TRX2 format)
 │   ├── PacketSigner.kt    HMAC-SHA256
 │   ├── BackendApi.kt      OkHttp calls to /order and /emergency/sms
 │   └── SmsSender.kt       SmsManager call + sent-status confirmation
@@ -107,24 +160,73 @@ app/src/test/.../PacketTest.kt   wire format, signature vectors, SMS size
 
 ## What is verified, and what isn't
 
-- **Verified:** the project compiles, lint reports no errors, and the unit
-  tests pass. The tests pin the HMAC against a published test vector and
-  the full wire packet against a signature computed independently in .NET,
-  on top of the earlier cross-checks against Python's `hmac` and the web
-  UI's Web Crypto implementation.
-- **Not yet verified:** the app has not been run on a device or emulator
-  from this build, and the real-SMS path has not been exercised on a phone
-  with a SIM. Do a full run-through on the demo phone before presenting.
+Only what a test actually produced is claimed here.
+
+**Verified by tests that run in this repo** — 58 backend tests
+(`npm test` in `firebase/functions`) and 12 Android unit tests
+(`gradlew.bat :app:testDebugUnitTest`), all passing:
+
+- The HMAC matches a published test vector, and the full v2 wire packet
+  matches a signature pinned independently in both the Kotlin and the
+  JavaScript test suites, so a format change on either side fails a test on
+  that side.
+- The longest packet the server's own shape checks will accept is 146
+  characters, inside one 160-character GSM-7 segment. This is asserted
+  against the limits themselves, not against a sample packet.
+- A v1 `TRX` packet is refused, and relabelling one as `TRX2` fails the
+  signature check.
+- Exactly-once, on the terms described above: a replay returns the stored
+  result; a `tx_id` reused with different bytes is a conflict; a forged
+  packet creates no ledger record; a duplicate arriving after expiry gets
+  the original fill; ten concurrent copies of one packet produce one
+  execution and nine identical replays.
+- Every terminal outcome is replayed rather than re-decided — a refusal
+  stays refused even after the price rises above the floor or the clock
+  comes back into range.
+
+**Important caveat on where those proofs hold.** The guarantees above are
+proven against `MemoryStore`, the in-memory store adapter, which serializes
+transactions to model what Firestore provides. `FirestoreStore` implements
+the same interface and is a direct transposition of the original
+transaction, but **it has not been run against the Firestore emulator**, so
+nothing here demonstrates that the deployed function behaves identically.
+Treat the exactly-once claim as proven for the logic and untested for the
+production store.
+
+- **TODO (Phase 6, CI):** a Firestore emulator smoke test that runs the
+  duplicate, late-duplicate and concurrent-copies cases through
+  `FirestoreStore`. Until that exists, the caveat above stands.
+
+**Not verified at all:**
+
+- The app has not been run on a device or emulator from this build, and the
+  real-SMS path has not been exercised on a phone with a SIM.
+- No real broker is involved. "Executes" means a row changes in a simulated
+  ledger. Exactly-once is a property of **that ledger**; it says nothing
+  about whether a real broker API would double-fill, since a real broker
+  has not been called.
+- The failure lab (Phase 2) is not written yet, so no number here comes
+  from running thousands of packets — only from the named tests above.
 
 ## Known limits (deliberate, for a demo)
 
-- The signing secret and PIN are constants in source. A real build would
-  provision a per-device key into the Android Keystore and verify the PIN
-  (or biometrics) against something the server controls.
+- The signing secret and PIN are constants in source — one secret shared by
+  every install. Phase 3 replaces it with a key provisioned per device at
+  enrollment and held in the Android Keystore, unlocked by biometrics or the
+  device credential. Note that the signature stays an HMAC, so the server
+  necessarily holds a copy of each device's key and could forge that
+  device's packets; what the Keystore protects is use of the key on the
+  phone, not its secrecy from the backend. Asymmetric signatures would fix
+  that and are out of scope: an ECDSA P-256 signature is 128 hex characters,
+  which puts the packet at roughly 204 and breaks the one-segment
+  guarantee.
 - On the SMS channel the app shows **Order sent**, not *executed*: the
   radio confirmed the message, but the fill is confirmed by the backend,
-  which an offline phone can't hear from. Reading the broker's reply SMS
-  would close that loop.
+  which an offline phone can't hear from. Phase 3 closes that loop with a
+  server-signed confirmation SMS the app verifies before it says
+  *executed*. That needs `RECEIVE_SMS`, which Google Play treats as a
+  restricted permission: fine for a portfolio project run by sideload, not
+  shippable to the Play Store as-is.
 - Holdings and prices are demo data held in memory.
 - Google Play restricts `SEND_SMS` to default SMS apps and a few approved
   use cases, so this would ship by sideload/enterprise distribution, or
