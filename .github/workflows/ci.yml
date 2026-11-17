@@ -4,6 +4,13 @@ on:
   push:
   pull_request:
 
+# A branch with an open PR fires both triggers, which produces two runs per
+# push and makes "the run for commit X" ambiguous. Superseded runs are
+# cancelled so the newest one is the only one in flight.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   backend:
     name: Backend, demo and failure lab
@@ -28,6 +35,17 @@ jobs:
         working-directory: firebase/functions
         run: npm ci
 
+      # The emulator smoke test is the only thing here with a dependency,
+      # and a missing one shows up as a bare MODULE_NOT_FOUND several steps
+      # later. This turns that into a failure at the install step, naming
+      # the path it looked in, resolved from the test's OWN directory --
+      # which is where Node resolves a bare specifier from, regardless of
+      # any step's working directory.
+      - name: Check the emulator test's dependencies resolve
+        run: |
+          node -e "console.log('firebase-admin/app ->', require.resolve('firebase-admin/app', { paths: ['firebase/functions/emulator-test'] }))"
+          node -e "console.log('firebase-admin version:', require('./firebase/functions/node_modules/firebase-admin/package.json').version)"
+
       - name: Backend tests
         working-directory: firebase/functions
         run: npm test
@@ -51,11 +69,34 @@ jobs:
       - name: Install the Firebase CLI
         run: npm install --global firebase-tools@15
 
+      # Run from firebase/functions, not firebase/, so the working
+      # directory IS the package root that owns node_modules. Node resolves
+      # a bare specifier from the requiring file upward, so cwd should not
+      # matter -- but this removes the question entirely, and NODE_PATH
+      # below removes it again for whatever process the CLI spawns.
+      # --config points back at the firebase.json one level up.
       - name: Firestore emulator smoke test
-        working-directory: firebase
+        working-directory: firebase/functions
+        env:
+          NODE_PATH: ${{ github.workspace }}/firebase/functions/node_modules
         run: >
           firebase emulators:exec --only firestore --project traderescue-emulator
-          "node functions/emulator-test/firestore.smoke.js"
+          --config ../firebase.json
+          "node emulator-test/firestore.smoke.js"
+
+      # Printed only when the step above fails, so a module-resolution
+      # problem is diagnosed in the same run instead of the next one.
+      - name: Diagnose a failed emulator run
+        if: failure()
+        working-directory: firebase/functions
+        run: |
+          echo "--- cwd ---"; pwd
+          echo "--- node/npm ---"; node --version; npm --version
+          echo "--- is node_modules here? ---"; ls -d node_modules 2>&1 | head -1
+          echo "--- firebase-admin ---"; ls -d node_modules/firebase-admin 2>&1 | head -1
+          echo "--- npm ls ---"; npm ls --depth=0 2>&1 | head -10
+          echo "--- resolution from the test directory ---"
+          node -e "try { console.log(require.resolve('firebase-admin/app', { paths: ['emulator-test'] })) } catch (e) { console.log('FAILED:', e.message) }"
 
       # Before trusting the lab, confirm it still catches a broken service.
       # If this fails, the lab has a blind spot and its result below means
