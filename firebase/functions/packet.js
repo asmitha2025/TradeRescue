@@ -2,12 +2,8 @@
 
 const crypto = require("crypto");
 
-// Must match SIGNING_SECRET in the Android app's PacketSigner.kt. Demo only:
-// Phase 3 replaces this with a per-device key provisioned at enrollment.
-const DEMO_SECRET = "TRADERESCUE_DEMO_SECRET_NOT_FOR_PRODUCTION";
-
-const VERSION = "TRX2";
-const FIELD_COUNT = 12;
+const VERSION = "TRX3";
+const FIELD_COUNT = 13;
 
 // How far ahead of us a phone's clock may be before we stop believing its
 // timestamp. SMS is store-and-forward, so lateness is normal; being from
@@ -33,9 +29,16 @@ class OrderError extends Error {
   }
 }
 
-/** HMAC-SHA256 truncated to 32 hex chars, same as the app. */
-function sign(secret, payload) {
-  return crypto.createHmac("sha256", secret).update(payload, "utf8").digest("hex").slice(0, 32);
+/** HMAC-SHA256 truncated to 32 hex chars, over a sub-key never the device secret. */
+function sign(key, payload) {
+  return crypto.createHmac("sha256", key).update(payload, "utf8").digest("hex").slice(0, 32);
+}
+
+/** Constant-time comparison of two hex tags. */
+function tagsMatch(given, expected) {
+  const a = Buffer.from(String(given), "utf8");
+  const b = Buffer.from(expected, "utf8");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 /**
@@ -54,22 +57,28 @@ const MAX_WIRE_LENGTH = 160;
  *
  * These are not arbitrary: the sum below has to leave the whole packet
  * inside one segment, so the limits are the budget. Being generous with a
- * field here spends characters that a real symbol or a real quantity might
- * need. Every value is comfortably above what a correct client produces --
- * the app's tx_id is 9 characters and its nonce is 8.
+ * field here spends characters a real symbol or quantity might need. Every
+ * value is comfortably above what a correct client produces -- the app's
+ * tx_id is 9 characters, its nonce is 8 and its key id is 8.
+ *
+ * key_id cost 8 characters plus a separator when it was added in TRX3. The
+ * nonce paid for most of that: it is signature entropy only, and 12
+ * characters of it is still half as much again as the app generates.
  */
 const LIMITS = {
+  keyId: 8,
   txId: 12,
   userId: 12,
   symbol: 16,
   qty: 9,
   floorPaise: 10, // Rs 1,00,00,000 a share, in paise
   expiresAt: 11,
-  nonce: 16,
+  nonce: 12,
   timestamp: 11,
 };
 
 const SHAPES = {
+  keyId: new RegExp(`^[0-9a-f]{${LIMITS.keyId}}$`),
   txId: new RegExp(`^[A-Za-z0-9]{1,${LIMITS.txId}}$`),
   userId: new RegExp(`^[A-Za-z0-9]{1,${LIMITS.userId}}$`),
   action: /^[A-Z]$/,
@@ -88,8 +97,7 @@ const SHAPES = {
  * format rather than of how the current client happens to fill it in.
  */
 function maxPermittedWireLength() {
-  const variable = LIMITS.txId + LIMITS.userId + LIMITS.symbol + LIMITS.qty +
-    LIMITS.floorPaise + LIMITS.expiresAt + LIMITS.nonce + LIMITS.timestamp;
+  const variable = Object.values(LIMITS).reduce((sum, n) => sum + n, 0);
   return (
     VERSION.length +
     variable +
@@ -100,40 +108,53 @@ function maxPermittedWireLength() {
 }
 
 /**
- * Parses and authenticates a wire packet:
- *   TRX2|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+ * Splits a wire packet far enough to find out which key signed it, and no
+ * further.
  *
- * floor is a price floor in paise, 0 meaning "exit at any price".
- *
- * This checks only what a packet *is*: shape and signature. It deliberately
- * does not check expiry, limits or the floor, because those decide what
- * happens to a packet and must run after the tx_id lookup -- a duplicate
- * that arrives after its expiry has to replay the original outcome rather
- * than be told it is late. service.js owns that order.
- *
- * Throws OrderError if the packet is malformed or forged. Nothing that
- * fails here may ever claim a tx_id.
+ * The key id has to be read before the signature can be checked, so this
+ * runs before anything is authenticated. It therefore trusts nothing: the
+ * field count, the version and the shape of the key id, and every other
+ * field left alone until a real key has vouched for them.
  */
-function verifyPacket(wire, secret) {
+function parsePacket(wire) {
   const canonical = String(wire || "").trim();
   const parts = canonical.split("|");
   if (parts.length !== FIELD_COUNT || parts[0] !== VERSION) {
-    // An old TRX packet lands here: the version is part of the signed
-    // payload, so a v1 packet cannot be upgraded by rewriting its prefix.
+    // An older TRX or TRX2 packet lands here. The version is inside the
+    // signed payload, so no packet can be relabelled into this format.
     throw new OrderError(400, `Not a ${VERSION} TradeRescue packet`, "BAD_FORMAT");
   }
-  const [, txId, userId, action, symbol, qtyText, orderType, floorText, expiresText, nonce, tsText, signature] = parts;
+  const keyId = parts[1];
+  if (!SHAPES.keyId.test(keyId)) throw new OrderError(400, "Malformed key id", "BAD_FORMAT");
+  return {
+    canonical,
+    parts,
+    keyId,
+    signedPayload: parts.slice(0, FIELD_COUNT - 1).join("|"),
+    signature: parts[FIELD_COUNT - 1],
+  };
+}
 
-  const expected = sign(secret, parts.slice(0, 11).join("|"));
-  const given = Buffer.from(signature, "utf8");
-  const wanted = Buffer.from(expected, "utf8");
-  if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) {
+/**
+ * Authenticates a parsed packet against a device's request sub-key and
+ * returns its fields.
+ *
+ * The signature is checked before any other field is looked at, so the
+ * shape rules only ever run on packets the keyholder actually sent.
+ * Nothing here judges time, limits or the floor: those decide what happens
+ * to a packet and must run after the tx_id lookup, or a duplicate arriving
+ * late would be told it is late instead of replaying its outcome.
+ */
+function verifyParsed(parsed, requestKey) {
+  const { parts, canonical, keyId } = parsed;
+  if (!tagsMatch(parsed.signature, sign(requestKey, parsed.signedPayload))) {
     throw new OrderError(401, "Signature check failed", "BAD_SIGNATURE");
   }
 
   // Everything below is only reached by packets signed with the right key.
+  const [, , txId, userId, action, symbol, qtyText, orderType, floorText, expiresText, nonce, tsText] = parts;
   const fields = {
-    txId, userId, action, symbol, qty: qtyText, orderType,
+    keyId, txId, userId, action, symbol, qty: qtyText, orderType,
     floorPaise: floorText, expiresAt: expiresText, nonce, timestamp: tsText,
   };
   for (const [name, pattern] of Object.entries(SHAPES)) {
@@ -142,17 +163,22 @@ function verifyPacket(wire, secret) {
 
   return {
     version: parts[0],
-    txId, userId, action, symbol,
+    keyId, txId, userId, action, symbol,
     qty: Number(qtyText),
     orderType,
     floorPaise: Number(floorText),
     expiresAt: Number(expiresText),
     nonce,
     timestamp: Number(tsText),
-    signature,
+    signature: parsed.signature,
     canonical,
     packetHash: hashPacket(canonical),
   };
+}
+
+/** parse + verify, for callers that already hold the key. */
+function verifyPacket(wire, requestKey) {
+  return verifyParsed(parsePacket(wire), requestKey);
 }
 
 /**
@@ -163,8 +189,72 @@ function effectiveExpiry({ expiresAt, timestamp }) {
   return Math.min(expiresAt, timestamp + MAX_VALIDITY_SECONDS);
 }
 
+// ---------------------------------------------------------------------------
+// Confirmations: the server's signed reply
+// ---------------------------------------------------------------------------
+
+const CONFIRMATION_TAG_HEX = 16; // 64 bits, for a message that authorises nothing
+
+/**
+ * The confirmation's text, without its tag.
+ *
+ * Deliberately short. The old reply spelled out the total in rupees and the
+ * time in words, which left no room for a signature inside one segment --
+ * and an unsigned confirmation is one an attacker can write. The time is
+ * epoch seconds rather than "17 Nov 2026, 10:45 pm IST" because a localised
+ * string is a poor thing to sign: it varies with locale and can carry
+ * characters that push the message out of GSM-7. The app renders a friendly
+ * time from it.
+ */
+function confirmationText(fields) {
+  if (fields.status === "FILLED") {
+    return `TradeRescue: SOLD ${fields.quantity} ${fields.symbol} @Rs${fields.fillPrice.toFixed(2)}` +
+      ` (${fields.remaining} left) Ref ${fields.txId} ${fields.at}`;
+  }
+  return `TradeRescue: NOT SOLD (${fields.status}) Ref ${fields.txId} ${fields.at}`;
+}
+
+/** The text plus the tag the app checks before it believes a word of it. */
+function buildConfirmation(responseKey, fields) {
+  const text = confirmationText(fields);
+  return `${text} #${sign(responseKey, text).slice(0, CONFIRMATION_TAG_HEX)}`;
+}
+
+/**
+ * Checks a confirmation came from the server. Returns null when it did not,
+ * rather than a flag, so a caller cannot treat an unverified message as a
+ * fill by forgetting to read a boolean.
+ */
+function verifyConfirmation(message, responseKey) {
+  const text = String(message || "").trim();
+  const split = text.lastIndexOf(" #");
+  if (split < 0) return null;
+  const body = text.slice(0, split);
+  const tag = text.slice(split + 2);
+  if (tag.length !== CONFIRMATION_TAG_HEX) return null;
+  if (!tagsMatch(tag, sign(responseKey, body).slice(0, CONFIRMATION_TAG_HEX))) return null;
+
+  const filled = body.match(
+    /^TradeRescue: SOLD (\d+) ([A-Za-z0-9&-]+) @Rs([\d.]+) \((\d+) left\) Ref ([A-Za-z0-9]+) (\d+)$/,
+  );
+  if (filled) {
+    return {
+      status: "FILLED", quantity: Number(filled[1]), symbol: filled[2],
+      fillPrice: Number(filled[3]), remaining: Number(filled[4]),
+      txId: filled[5], at: Number(filled[6]), text: body,
+    };
+  }
+  const refused = body.match(/^TradeRescue: NOT SOLD \(([A-Z_]+)\) Ref ([A-Za-z0-9]+) (\d+)$/);
+  if (refused) {
+    return { status: refused[1], txId: refused[2], at: Number(refused[3]), text: body };
+  }
+  return null;
+}
+
 module.exports = {
-  DEMO_SECRET, VERSION, FIELD_COUNT, LIMITS, MAX_WIRE_LENGTH,
+  VERSION, FIELD_COUNT, LIMITS, MAX_WIRE_LENGTH, CONFIRMATION_TAG_HEX,
   MAX_CLOCK_SKEW_SECONDS, MAX_VALIDITY_SECONDS,
-  OrderError, sign, hashPacket, verifyPacket, effectiveExpiry, maxPermittedWireLength,
+  OrderError, sign, tagsMatch, hashPacket,
+  parsePacket, verifyParsed, verifyPacket, effectiveExpiry, maxPermittedWireLength,
+  confirmationText, buildConfirmation, verifyConfirmation,
 };

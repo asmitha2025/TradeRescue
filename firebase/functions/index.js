@@ -5,21 +5,78 @@ const { onRequest } = require("firebase-functions/v2/https");
 const logger = require("firebase-functions/logger");
 const { initializeApp } = require("firebase-admin/app");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
-const { DEMO_SECRET, OrderError } = require("./packet");
+const { OrderError } = require("./packet");
 const { FirestoreStore } = require("./store");
+const { SecretManagerKeyStore, MemoryKeyStore } = require("./keystore");
 const { TradeRescue } = require("./service");
 
 initializeApp();
 const db = getFirestore();
 
-// All the deciding happens in service.js against the store interface. This
+/**
+ * Device secrets belong in Secret Manager, not Firestore. The adapter for
+ * it is written but has never been run against the real API (see
+ * keystore.js and the README), so it is only wired up when a project is
+ * configured for it; otherwise the function falls back to an in-process
+ * store that forgets every key when the instance recycles. That is useless
+ * in production and obvious in a log, which is the point: a silent fallback
+ * to something weaker would be worse.
+ */
+function buildKeyStore() {
+  const projectId = process.env.SECRET_MANAGER_PROJECT;
+  if (!projectId) {
+    logger.warn("SECRET_MANAGER_PROJECT is not set: device keys are in memory and will not survive a restart");
+    return new MemoryKeyStore();
+  }
+  // Required lazily so the dependency is only needed when it is used.
+  const { SecretManagerServiceClient } = require("@google-cloud/secret-manager");
+  logger.info("device keys in Secret Manager", { projectId });
+  return new SecretManagerKeyStore(new SecretManagerServiceClient(), projectId);
+}
+
+// All the deciding happens in service.js against the store interfaces. This
 // file is only transport: parse the request, call one method, shape the
 // response. Nothing here knows what a valid packet looks like.
 const app = new TradeRescue({
   store: new FirestoreStore(db, FieldValue),
-  signingSecret: process.env.SIGNING_SECRET || DEMO_SECRET,
+  keyStore: buildKeyStore(),
   log: logger,
 });
+
+/**
+ * Enrollment hands over a device secret, so it only happens over HTTPS.
+ *
+ * Cloud Functions terminate TLS upstream, so the check is on the forwarded
+ * protocol. The emulator serves plain http, and is allowed for that reason
+ * only.
+ */
+function requireHttps(req) {
+  if (process.env.FUNCTIONS_EMULATOR === "true") return;
+  const proto = String(req.get("x-forwarded-proto") || (req.secure ? "https" : "http")).split(",")[0].trim();
+  if (proto !== "https") {
+    throw new OrderError(400, "Enrollment requires HTTPS", "INSECURE_TRANSPORT");
+  }
+}
+
+/**
+ * The demo's stand-in for an authenticated session.
+ *
+ * A real deployment would enroll a device inside a logged-in session and
+ * never see this token. A shared enrollment token is NOT authentication:
+ * anyone holding it can enroll a device for any user id. The README says so
+ * in as many words. It exists so the device-key work can be demonstrated
+ * without first building the login that Phase 4 brings.
+ */
+const enrollToken = () => process.env.ENROLL_TOKEN || "demo-enroll";
+
+function requireEnrollment(req) {
+  requireHttps(req);
+  const given = Buffer.from(String(req.get("x-enroll-token") || ""), "utf8");
+  const wanted = Buffer.from(enrollToken(), "utf8");
+  if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) {
+    throw new OrderError(401, "Enrollment token required", "BAD_ENROLL_TOKEN");
+  }
+}
 
 /** Pulls sender and text out of whatever shape an SMS forwarder posts. */
 function pickSms(body) {
@@ -72,6 +129,29 @@ exports.api = onRequest({ region: "asia-south1", cors: true, maxInstances: 5 }, 
     if (req.method === "POST" && path === "/emergency/sms") {
       const wire = typeof req.body === "string" ? req.body : req.rawBody ? req.rawBody.toString("utf8") : "";
       res.json(await app.executePacket(wire, "HTTP_FALLBACK", null));
+      return;
+    }
+
+    // Device enrollment and key lifecycle. Online only: every one of
+    // these hands out or retires a secret, and none has an offline path.
+    if (req.method === "POST" && path === "/enroll") {
+      requireEnrollment(req);
+      const b = req.body || {};
+      res.json(await app.enrollDevice(String(b.user_id || "")));
+      return;
+    }
+
+    if (req.method === "POST" && path === "/keys/revoke") {
+      requireEnrollment(req);
+      const b = req.body || {};
+      res.json(await app.revokeDevice(String(b.key_id || "")));
+      return;
+    }
+
+    if (req.method === "POST" && path === "/keys/rotate") {
+      requireEnrollment(req);
+      const b = req.body || {};
+      res.json(await app.rotateDevice(String(b.key_id || "")));
       return;
     }
 

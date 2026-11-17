@@ -36,10 +36,12 @@ const { execFileSync } = require("child_process");
 
 const FUNCTIONS = path.join(__dirname, "..", "firebase", "functions");
 const { MemoryStore } = require(path.join(FUNCTIONS, "store"));
-const { TradeRescue } = require(path.join(FUNCTIONS, "service"));
+const { MemoryKeyStore } = require(path.join(FUNCTIONS, "keystore"));
+const { requestKey, responseKey } = require(path.join(FUNCTIONS, "keys"));
+const { TradeRescue, KEY_ROTATION_GRACE_SECONDS } = require(path.join(FUNCTIONS, "service"));
 const crypto = require("crypto");
 const PACKET = require(path.join(FUNCTIONS, "packet"));
-const { DEMO_SECRET, sign } = PACKET;
+const { sign, buildConfirmation } = PACKET;
 
 /**
  * The lab is an oracle, so it works out expiry and identity for itself
@@ -52,6 +54,13 @@ const { DEMO_SECRET, sign } = PACKET;
  */
 const LAB_VALIDITY_CAP = 15 * 60;
 const LAB_CLOCK_SKEW = 2 * 60;
+const LAB_ROTATION_GRACE = 15 * 60;
+if (LAB_ROTATION_GRACE !== KEY_ROTATION_GRACE_SECONDS) {
+  throw new Error(
+    "the lab's copy of the rotation grace has drifted from service.js: " +
+    `${LAB_ROTATION_GRACE} vs ${KEY_ROTATION_GRACE_SECONDS}`,
+  );
+}
 if (LAB_VALIDITY_CAP !== PACKET.MAX_VALIDITY_SECONDS || LAB_CLOCK_SKEW !== PACKET.MAX_CLOCK_SKEW_SECONDS) {
   throw new Error(
     "the lab's copy of the timing constants has drifted from packet.js: " +
@@ -153,30 +162,58 @@ const PRICE_PAISE = Object.fromEntries(
 
 const BASE_TIME = 1700000000;
 
+/**
+ * The devices in a run, and the state their keys are in.
+ *
+ * Built from the seed, so a run is reproducible down to each device secret.
+ * Records are collected here and written into the key store before the run
+ * starts, which lets the scenario stay synchronous while still putting keys
+ * into revoked and rotated states the packets can then be aimed at.
+ */
+function newFleet(r) {
+  const devices = [];
+  const make = (opts = {}) => {
+    const record = {
+      keyId: r.hex(4),
+      userId: LAB_USER,
+      secret: Buffer.from(r.hex(32), "hex"),
+      status: "active",
+      rotatedAt: null,
+      replacedBy: null,
+      createdAt: BASE_TIME,
+      ...opts,
+    };
+    devices.push(record);
+    return record;
+  };
+  const primary = make();
+  return { devices, make, primary, other: make() };
+}
+
 // ---------------------------------------------------------------------------
 // Packet construction
 // ---------------------------------------------------------------------------
 
-function wireOf(p) {
+function wireOf(p, key) {
   const payload = [
-    "TRX2", p.txId, p.userId, p.action, p.symbol, String(p.qty), p.orderType,
+    "TRX3", p.keyId, p.txId, p.userId, p.action, p.symbol, String(p.qty), p.orderType,
     String(p.floorPaise), String(p.expiresAt), p.nonce, String(p.timestamp),
   ].join("|");
-  return `${payload}|${sign(DEMO_SECRET, payload)}`;
+  return `${payload}|${sign(key, payload)}`;
 }
 
 /** Breaks a packet's signature without changing its shape or field count. */
 function tamperWith(wire, r) {
   const parts = wire.split("|");
   const how = r.pick(["qty", "symbol", "floor", "signature"]);
-  if (how === "qty") parts[5] = String(Number(parts[5]) + r.int(1, 9));
-  else if (how === "symbol") parts[4] = parts[4].split("").reverse().join("");
-  else if (how === "floor") parts[7] = String(Number(parts[7]) + 100);
+  if (how === "qty") parts[6] = String(Number(parts[6]) + r.int(1, 9));
+  else if (how === "symbol") parts[5] = parts[5].split("").reverse().join("");
+  else if (how === "floor") parts[8] = String(Number(parts[8]) + 100);
   else {
-    const sig = parts[11].split("");
+    const sig = parts[12].split("");
     const i = r.int(0, sig.length - 1);
     sig[i] = sig[i] === "a" ? "b" : "a";
-    parts[11] = sig.join("");
+    parts[12] = sig.join("");
   }
   return { wire: parts.join("|"), how };
 }
@@ -200,6 +237,11 @@ const FAULT_WEIGHTS = {
   conflict: 8,
   clock_skew_within: 2,
   clock_skew_beyond: 2,
+  revoked_key: 5,
+  wrong_device_key: 5,
+  rotation_in_flight: 5,
+  rotation_too_late: 4,
+  reflected_confirmation: 4,
 };
 
 /**
@@ -210,7 +252,7 @@ const FAULT_WEIGHTS = {
  * signature is intact, and which payload it carries) so the invariants can
  * be checked without asking the server what it thinks.
  */
-function planPacket(i, r, faultOverride) {
+function planPacket(i, r, fleet, faultOverride) {
   const fault = faultOverride || r.weighted(FAULT_WEIGHTS);
   const symbol = r.pick(SYMBOLS);
   const issued = BASE_TIME + i * 2; // issue times spread out, two seconds apart
@@ -228,7 +270,31 @@ function planPacket(i, r, faultOverride) {
       : floorChoice === "below" ? Math.max(1, PRICE_PAISE[symbol] - r.int(1, 5000))
         : PRICE_PAISE[symbol] + r.int(1, 5000);
 
+  // Which device signs, and what state its key is in. The lab decides this
+  // for itself rather than asking the server, because it is about to check
+  // the server's answer against it.
+  let device = fleet.primary;
+  let signingSecret = null; // null means "this device's own secret"
+  let direction = "req";
+  let rotatedAt = null;
+  if (fault === "revoked_key") {
+    // Two thirds revoked, one third a key id that was never enrolled.
+    device = r.next() < 0.67
+      ? fleet.make({ status: "revoked" })
+      : { keyId: r.hex(4), secret: Buffer.from(r.hex(32), "hex"), status: "unknown" };
+  } else if (fault === "wrong_device_key") {
+    // This device's key id, another device's secret: the signature cannot
+    // match whichever of the two the server looks up.
+    signingSecret = fleet.other.secret;
+  } else if (fault === "rotation_in_flight" || fault === "rotation_too_late") {
+    rotatedAt = timestamp;
+    device = fleet.make({ status: "rotated", rotatedAt, replacedBy: fleet.primary.keyId });
+  } else if (fault === "reflected_confirmation") {
+    direction = "resp";
+  }
+
   const base = {
+    keyId: device.keyId,
     txId: `TX${String(i).padStart(8, "0")}`.slice(0, 12),
     userId: LAB_USER,
     action: r.weighted({ S: 97, B: 3 }), // a few buys, which the channel must refuse
@@ -240,18 +306,37 @@ function planPacket(i, r, faultOverride) {
     timestamp,
     expiresAt: timestamp + validity,
   };
-  const wire = wireOf(base);
+  const secret = signingSecret || device.secret;
+  const signingKey = direction === "resp" ? responseKey(secret) : requestKey(secret);
+  const wire = wireOf(base, signingKey);
   const expiry = expiryOf(base);
 
   // When the first copy arrives. Normal networks are slightly late.
-  const firstAt = fault === "delay_past_expiry"
-    ? expiry + r.int(1, 3600)
-    : issued + r.int(0, Math.max(1, Math.min(validity - 5, 120)));
+  let firstAt;
+  if (fault === "delay_past_expiry") firstAt = expiry + r.int(1, 3600);
+  else if (fault === "rotation_in_flight") firstAt = rotatedAt + r.int(0, LAB_ROTATION_GRACE);
+  else if (fault === "rotation_too_late") firstAt = rotatedAt + LAB_ROTATION_GRACE + r.int(1, 3600);
+  else firstAt = issued + r.int(0, Math.max(1, Math.min(validity - 5, 120)));
+
+  /**
+   * Whether this delivery's key was entitled to sign an order at the moment
+   * it arrived. Worked out here, independently of the server, because the
+   * invariant about it compares the two.
+   */
+  const keyAuthorised = (at) => {
+    if (direction !== "req") return false;        // signed in the wrong direction
+    if (signingSecret) return false;              // another device's secret
+    if (device.status === "unknown") return false;
+    if (device.status === "revoked") return false;
+    if (device.status === "rotated") return at <= device.rotatedAt + LAB_ROTATION_GRACE;
+    return true;
+  };
 
   const deliveries = [];
   const add = (at, w, extra = {}) => deliveries.push({
     at, wire: w, txId: base.txId, qty: base.qty, symbol: base.symbol,
-    signatureIntact: true, payload: w, fault, ...extra,
+    signatureIntact: true, payload: w, fault, keyId: base.keyId,
+    keyAuthorised: keyAuthorised(at), ...extra,
   });
 
   if (fault === "drop") {
@@ -274,7 +359,7 @@ function planPacket(i, r, faultOverride) {
     // lab cannot assume which of the two gets there first, so the invariant
     // is "at most one distinct payload per tx_id ever executes".
     const other = { ...base, qty: base.qty + r.int(1, 10), nonce: r.hex(4) };
-    const otherWire = wireOf(other);
+    const otherWire = wireOf(other, signingKey);
     add(firstAt, wire);
     add(firstAt + r.int(-30, 30), otherWire, { qty: other.qty, conflicting: true });
   } else if (fault === "reorder") {
@@ -284,29 +369,53 @@ function planPacket(i, r, faultOverride) {
     // it was issued would read as a client clock ahead of the server and
     // the fault would quietly turn into a clock-skew test instead.
     add(Math.max(timestamp, firstAt - r.int(100, 400)), wire);
+  } else if (fault === "reflected_confirmation") {
+    // Half of these are an order-shaped packet signed with the response
+    // sub-key; the other half are a literal confirmation message fed back
+    // in. Neither may ever be read as an order.
+    if (r.next() < 0.5) {
+      add(firstAt, wire);
+    } else {
+      const text = buildConfirmation(responseKey(device.secret), {
+        status: "FILLED", quantity: base.qty, symbol: base.symbol,
+        fillPrice: PRICE_PAISE[base.symbol] / 100, remaining: 10,
+        txId: base.txId, at: timestamp,
+      });
+      add(firstAt, text, { signatureIntact: false });
+    }
   } else {
     add(firstAt, wire);
   }
 
-  return { base, wire, expiry, fault, deliveries };
+  return { base, wire, expiry, fault, deliveries, device };
 }
 
 // ---------------------------------------------------------------------------
 // One run
 // ---------------------------------------------------------------------------
 
-async function runOnce(seed, packetCount, boundaryCases) {
+async function runOnce(seed, packetCount, makeBoundaryCases) {
   const r = rng(seed);
   const store = new MemoryStore();
+  const keyStore = new MemoryKeyStore();
   await store.setUserHoldings(LAB_USER, labHoldings());
   const clock = { t: BASE_TIME };
-  const app = new TradeRescue({ store, now: () => clock.t });
+  const app = new TradeRescue({ store, keyStore, now: () => clock.t });
 
+  const fleet = newFleet(r);
   const plans = [];
-  for (let i = 0; i < packetCount; i++) plans.push(planPacket(i, r));
+  for (let i = 0; i < packetCount; i++) plans.push(planPacket(i, r, fleet));
   // The deliberate boundary cases ride along in every run, whatever the
   // seed, so they are never skipped by chance.
+  const boundaryCases = makeBoundaryCases(fleet);
   for (const b of boundaryCases) plans.push(b.plan);
+
+  // Every device the scenario invented, in whatever state it invented it
+  // in, goes into the key store before the first packet arrives. Devices
+  // with status "unknown" are deliberately left out: that is the point.
+  for (const device of fleet.devices) {
+    if (device.status !== "unknown") await keyStore.put(device);
+  }
 
   const deliveries = plans.flatMap((p) => p.deliveries);
   // Arrival order, not issue order. Ties keep their relative order, which
@@ -339,7 +448,7 @@ async function runOnce(seed, packetCount, boundaryCases) {
     }
   }
 
-  return { seed, plans, observations, store, clock, boundaryCases };
+  return { seed, plans, observations, store, keyStore, clock, boundaryCases, fleet };
 }
 
 /**
@@ -362,6 +471,7 @@ function observe(delivery, settled, at) {
     at,
     fault: delivery.fault,
     signatureIntact: delivery.signatureIntact,
+    keyAuthorised: delivery.keyAuthorised !== false,
     conflicting: Boolean(delivery.conflicting),
     payloadHash: payloadHashOf(delivery.wire),
     qty: delivery.qty,
@@ -378,7 +488,10 @@ function observe(delivery, settled, at) {
     // reporting a missing field as a mismatch.
     response: ok
       ? value
-      : { status: error.code, tx_id: delivery.txId, message: error.message, http_status: error.status },
+      : {
+        status: error.code, tx_id: delivery.txId, message: error.message,
+        http_status: error.status, at: error.at,
+      },
   };
 }
 
@@ -430,10 +543,14 @@ async function checkInvariants(run) {
 
   // 3. No fill from an invalid signature.
   {
+    // A tampered packet fails the signature; a confirmation fed back in is
+    // not even a packet and fails the format check first. Both are
+    // "refused before anything was decided", which is the property here.
+    const refusedUnsigned = new Set(["BAD_SIGNATURE", "BAD_FORMAT"]);
     const bad = observations
-      .filter((o) => !o.signatureIntact && o.outcome !== "BAD_SIGNATURE")
+      .filter((o) => !o.signatureIntact && !refusedUnsigned.has(o.outcome))
       .map((o) => ({ txId: o.txId, outcome: o.outcome }));
-    record("No fill from an invalid signature", "every tampered delivery answered BAD_SIGNATURE", bad);
+    record("No fill from an invalid signature", "every unsigned delivery refused before the ledger", bad);
   }
 
   // 4. No conflicting packet executed: at most one distinct payload per
@@ -498,7 +615,30 @@ async function checkInvariants(run) {
     record("One payload per tx_id answered, others conflict", "a different order never receives this order's result", bad);
   }
 
-  // 7. Every replay response identical to the stored outcome.
+  // 7. No fill from a key that was not entitled to sign.
+  //
+  //    Revoked, never enrolled, another device's, or the response sub-key
+  //    being reflected back as a request. Each of these must be refused the
+  //    way a forgery is -- before the ledger, with no tx_id claimed -- so
+  //    the check is not only "did it fill" but "did it leave a record".
+  {
+    const bad = [];
+    const allowed = new Set(["UNKNOWN_KEY", "REVOKED_KEY", "ROTATED_KEY", "BAD_SIGNATURE", "BAD_FORMAT"]);
+    for (const o of observations) {
+      if (o.keyAuthorised) continue;
+      if (o.filledFresh || o.outcome === "FILLED") {
+        bad.push({ txId: o.txId, keyId: o.keyId, outcome: o.outcome, note: "filled on an unauthorised key" });
+      } else if (!allowed.has(o.outcome)) {
+        bad.push({ txId: o.txId, keyId: o.keyId, outcome: o.outcome, note: "unauthorised key got past the key check" });
+      }
+      if (ledgerByTx.has(o.txId) && !byTx.get(o.txId).some((x) => x.keyAuthorised)) {
+        bad.push({ txId: o.txId, keyId: o.keyId, note: "unauthorised key claimed a tx_id" });
+      }
+    }
+    record("No fill from a revoked, unknown or wrong-direction key", "unauthorised keys never reach the ledger", bad);
+  }
+
+  // 8. Every replay response identical to the stored outcome.
   {
     const bad = [];
     for (const [txId, obs] of byTx) {
@@ -538,7 +678,7 @@ function normalise(response) {
  * than merely observed, because an off-by-one here is exactly the kind of
  * thing a random population would hit rarely and report as noise.
  */
-function boundaryCases(indexBase) {
+function boundaryCases(indexBase, fleet) {
   const cases = [
     { name: "1s before expires_at", offset: -1, expect: "FILLED" },
     { name: "exactly at expires_at", offset: 0, expect: "FILLED" },
@@ -548,12 +688,13 @@ function boundaryCases(indexBase) {
     const timestamp = BASE_TIME + 1;
     const validity = 600;
     const base = {
+      keyId: fleet.primary.keyId,
       txId: `BOUND${String(indexBase + n).padStart(4, "0")}`.slice(0, 12),
       userId: LAB_USER, action: "S", symbol: "RELIANCE", qty: 1,
       orderType: "I", floorPaise: 0, nonce: "b0undary",
       timestamp, expiresAt: timestamp + validity,
     };
-    const wire = wireOf(base);
+    const wire = wireOf(base, requestKey(fleet.primary.secret));
     const expiry = expiryOf(base);
     return {
       ...c,
@@ -562,7 +703,7 @@ function boundaryCases(indexBase) {
         base, wire, expiry, fault: "boundary",
         deliveries: [{
           at: expiry + c.offset, wire, txId: base.txId, qty: base.qty, symbol: base.symbol,
-          signatureIntact: true, fault: "boundary",
+          signatureIntact: true, keyAuthorised: true, keyId: base.keyId, fault: "boundary",
         }],
       },
     };
@@ -761,6 +902,11 @@ const FAULT_DESCRIPTIONS = {
   conflict: "a second correctly signed packet reusing the tx_id for a different order",
   clock_skew_within: "client clock ahead, inside the 2-minute backstop",
   clock_skew_beyond: "client clock ahead, beyond the backstop",
+  revoked_key: "signed by a device whose key was revoked before the packet arrived",
+  wrong_device_key: "another enrolled device's key signing under this key id",
+  rotation_in_flight: "signed before a rotation, arriving inside the grace window",
+  rotation_too_late: "signed before a rotation, arriving after the grace window",
+  reflected_confirmation: "a server confirmation fed back in as if it were an order",
   boundary: "the deliberate expiry boundary cases",
 };
 
@@ -781,8 +927,7 @@ async function main() {
     // Derived deterministically from the base seed, so one --seed value
     // reproduces the whole run.
     const seed = opts.seed + s * 7919;
-    const bounds = boundaryCases(s * 10);
-    const run = await runOnce(seed, opts.packets, bounds);
+    const run = await runOnce(seed, opts.packets, (fleet) => boundaryCases(s * 10, fleet));
     run.invariants = await checkInvariants(run);
     run.boundaries = checkBoundaries(run);
     runs.push(run);

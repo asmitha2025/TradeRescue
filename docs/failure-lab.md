@@ -13,19 +13,19 @@ broker.** No packet crosses a radio and no transaction reaches Google.
 
 |  |  |
 |---|---|
-| Commit | `9b9dc1b (working tree dirty: 1 other file(s))` |
-| Date | 2026-11-17T09:08:33.912Z |
+| Commit | `ec4efe4 (working tree dirty: 10 other file(s))` |
+| Date | 2026-11-17T09:24:46.443Z |
 | Base seed | `20261117` |
 | Seeds run | `20261117`, `20269036`, `20276955`, `20284874`, `20292793` |
 | Packets per seed | 10,000 |
 | Packets total | 50,000 |
-| Deliveries total | 91,104 |
-| Runtime | 5.5s |
+| Deliveries total | 83,524 |
+| Runtime | 12.9s |
 | Node | v24.13.1 |
 
 ## Result
 
-**All 7 invariants held on all 5 seeds, and all boundary cases matched.**
+**All 8 invariants held on all 5 seeds, and all boundary cases matched.**
 
 ## Invariants
 
@@ -37,6 +37,7 @@ broker.** No packet crosses a radio and no transaction reaches Google.
 | No conflicting packet ever executed | pass | pass | pass | pass | pass |
 | Holdings never negative, final = initial - fills | pass | pass | pass | pass | pass |
 | One payload per tx_id answered, others conflict | pass | pass | pass | pass | pass |
+| No fill from a revoked, unknown or wrong-direction key | pass | pass | pass | pass | pass |
 | Every replay identical to the stored outcome | pass | pass | pass | pass | pass |
 
 ## Boundary cases
@@ -57,16 +58,21 @@ Counted by packet, across all seeds.
 
 | Fault | Packets | Deliveries | What it does |
 |---|---|---|---|
-| `clean` | 14,986 | 14,986 | control group: delivered once, on time, intact |
-| `duplicate` | 7,043 | 21,150 | 2–4 copies delivered, seconds to minutes apart |
-| `concurrent_duplicate` | 5,031 | 30,093 | 2–10 copies delivered in the same instant, in flight together |
-| `reorder` | 5,003 | 5,003 | delivered out of issue order, ahead of earlier packets |
-| `drop` | 4,045 | 0 | never delivered at all |
-| `conflict` | 4,019 | 8,038 | a second correctly signed packet reusing the tx_id for a different order |
-| `tamper` | 3,952 | 5,898 | a field or the signature altered after signing; sometimes races the genuine copy |
-| `delay_past_expiry` | 3,899 | 3,899 | first delivery arrives after the effective expiry |
-| `clock_skew_beyond` | 1,039 | 1,039 | client clock ahead, beyond the backstop |
-| `clock_skew_within` | 983 | 983 | client clock ahead, inside the 2-minute backstop |
+| `clean` | 12,039 | 12,039 | control group: delivered once, on time, intact |
+| `duplicate` | 5,670 | 17,013 | 2–4 copies delivered, seconds to minutes apart |
+| `reorder` | 4,110 | 4,110 | delivered out of issue order, ahead of earlier packets |
+| `concurrent_duplicate` | 4,080 | 24,684 | 2–10 copies delivered in the same instant, in flight together |
+| `tamper` | 3,334 | 5,003 | a field or the signature altered after signing; sometimes races the genuine copy |
+| `drop` | 3,323 | 0 | never delivered at all |
+| `delay_past_expiry` | 3,293 | 3,293 | first delivery arrives after the effective expiry |
+| `conflict` | 3,216 | 6,432 | a second correctly signed packet reusing the tx_id for a different order |
+| `wrong_device_key` | 2,091 | 2,091 | another enrolled device's key signing under this key id |
+| `rotation_in_flight` | 2,058 | 2,058 | signed before a rotation, arriving inside the grace window |
+| `revoked_key` | 2,005 | 2,005 | signed by a device whose key was revoked before the packet arrived |
+| `reflected_confirmation` | 1,648 | 1,648 | a server confirmation fed back in as if it were an order |
+| `rotation_too_late` | 1,580 | 1,580 | signed before a rotation, arriving after the grace window |
+| `clock_skew_beyond` | 792 | 792 | client clock ahead, beyond the backstop |
+| `clock_skew_within` | 761 | 761 | client clock ahead, inside the 2-minute backstop |
 | `boundary` | 15 | 15 | the deliberate expiry boundary cases |
 
 ## Outcome distribution
@@ -76,20 +82,24 @@ from the execution it replays.
 
 | Outcome | Deliveries | Share |
 |---|---|---|
-| `FILLED (replayed)` | 28,094 | 30.84% |
-| `FILLED` | 27,804 | 30.52% |
-| `OVER_LIMIT` | 6,190 | 6.79% |
-| `OVER_LIMIT (replayed)` | 5,846 | 6.42% |
-| `TXID_CONFLICT` | 4,019 | 4.41% |
-| `BAD_SIGNATURE` | 3,952 | 4.34% |
-| `EXPIRED` | 3,890 | 4.27% |
-| `BELOW_FLOOR (replayed)` | 3,103 | 3.41% |
-| `BELOW_FLOOR` | 2,986 | 3.28% |
-| `NOT_SELL (replayed)` | 1,367 | 1.50% |
-| `NOT_SELL` | 1,340 | 1.47% |
-| `CLOCK_SKEW` | 909 | 1.00% |
-| `BAD_ORDER_TYPE` | 845 | 0.93% |
-| `BAD_ORDER_TYPE (replayed)` | 759 | 0.83% |
+| `FILLED` | 23,232 | 27.81% |
+| `FILLED (replayed)` | 22,933 | 27.46% |
+| `BAD_SIGNATURE` | 6,286 | 7.53% |
+| `OVER_LIMIT` | 5,169 | 6.19% |
+| `OVER_LIMIT (replayed)` | 4,949 | 5.93% |
+| `EXPIRED` | 4,055 | 4.85% |
+| `TXID_CONFLICT` | 3,216 | 3.85% |
+| `BELOW_FLOOR` | 2,597 | 3.11% |
+| `BELOW_FLOOR (replayed)` | 2,405 | 2.88% |
+| `ROTATED_KEY` | 1,580 | 1.89% |
+| `REVOKED_KEY` | 1,347 | 1.61% |
+| `NOT_SELL` | 1,210 | 1.45% |
+| `NOT_SELL (replayed)` | 988 | 1.18% |
+| `BAD_FORMAT` | 787 | 0.94% |
+| `BAD_ORDER_TYPE` | 756 | 0.91% |
+| `CLOCK_SKEW` | 684 | 0.82% |
+| `BAD_ORDER_TYPE (replayed)` | 672 | 0.80% |
+| `UNKNOWN_KEY` | 658 | 0.79% |
 
 
 A **first-time decision** is a delivery the server decided and wrote to
@@ -100,12 +110,12 @@ again, because they never became an order at all.
 
 |  |  |
 |---|---|
-| Deliveries processed | 91,104 |
-| First-time decisions &mdash; **filled** (shares actually sold) | **27,804** |
-| First-time decisions &mdash; refused (on the ledger, nothing sold) | 16,160 |
-| Replays served (no new decision) | 39,169 |
-| Stopped before the ledger (forged or conflicting) | 7,971 |
-| Packets dropped before arrival | 4,045 |
+| Deliveries processed | 83,524 |
+| First-time decisions &mdash; **filled** (shares actually sold) | **23,232** |
+| First-time decisions &mdash; refused (on the ledger, nothing sold) | 14,471 |
+| Replays served (no new decision) | 31,947 |
+| Stopped before the ledger (forged or conflicting) | 13,874 |
+| Packets dropped before arrival | 3,323 |
 
 ## Reproducing
 

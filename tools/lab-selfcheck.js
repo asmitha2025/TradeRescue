@@ -45,6 +45,11 @@ const MUTATIONS = [
     what: "a tx_id reused for a different order is treated as a replay",
     expect: ["One payload per tx_id answered, others conflict"],
   },
+  {
+    id: "accept-dead-keys",
+    what: "revoked and long-rotated keys are accepted, so a retired device can still sell",
+    expect: ["No fill from a revoked, unknown or wrong-direction key"],
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -62,27 +67,24 @@ if (process.env.LAB_MUTATION) {
     packet.effectiveExpiry = () => Number.MAX_SAFE_INTEGER;
   }
   if (mutation === "trust-signature") {
-    const real = packet.verifyPacket;
-    packet.verifyPacket = (wire, secret) => {
-      try {
-        return real(wire, secret);
-      } catch (e) {
-        if (e.code !== "BAD_SIGNATURE") throw e;
-        // Re-parse without caring whether the signature matched.
-        const parts = String(wire || "").trim().split("|");
-        const n = (v) => Number(v);
-        return {
-          version: parts[0], txId: parts[1], userId: parts[2], action: parts[3],
-          symbol: parts[4], qty: n(parts[5]), orderType: parts[6],
-          floorPaise: n(parts[7]), expiresAt: n(parts[8]), nonce: parts[9],
-          timestamp: n(parts[10]), signature: parts[11],
-          canonical: parts.join("|"), packetHash: packet.hashPacket(parts.join("|")),
-        };
-      }
-    };
+    // service.js parses and verifies in two steps now, so the mutation has
+    // to go where the comparison actually happens. Rewriting the signature
+    // to whatever would have been correct makes every packet verify while
+    // leaving the shape checks intact.
+    const real = packet.verifyParsed;
+    packet.verifyParsed = (parsed, key) =>
+      real({ ...parsed, signature: packet.sign(key, parsed.signedPayload) }, key);
   }
 
   const { TradeRescue } = require(path.join(FUNCTIONS, "service"));
+  if (mutation === "accept-dead-keys") {
+    // The bug: look the device up but never ask what state its key is in.
+    TradeRescue.prototype.resolveKey = async function (keyId) {
+      const device = await this.keyStore.get(keyId);
+      if (!device) throw new (require(path.join(FUNCTIONS, "packet")).OrderError)(401, "Unknown signing key", "UNKNOWN_KEY");
+      return device;
+    };
+  }
   if (mutation === "no-dedup") {
     const real = TradeRescue.prototype.decideOnce;
     TradeRescue.prototype.decideOnce = function (p, snapshot, channel, from) {
@@ -103,7 +105,7 @@ if (process.env.LAB_MUTATION) {
   const lab = require(path.join(__dirname, "failure-lab.js"));
 
   (async () => {
-    const run = await lab.runOnce(424242, 400, lab.boundaryCases(0));
+    const run = await lab.runOnce(424242, 400, (fleet) => lab.boundaryCases(0, fleet));
     const invariants = await lab.checkInvariants(run);
     const boundaries = lab.checkBoundaries(run);
     process.stdout.write(JSON.stringify({
@@ -141,13 +143,13 @@ function runMutation(id) {
 }
 
 (async () => {
-  console.log("Lab self-check: breaking the service on purpose, four ways.\n");
+  console.log("Lab self-check: breaking the service on purpose, five ways.\n");
   let bad = 0;
 
   // First, the unmutated control: the lab must be quiet on healthy code, or
   // every result below would be a false positive.
   const lab = require(path.join(__dirname, "failure-lab.js"));
-  const control = await lab.runOnce(424242, 400, lab.boundaryCases(0));
+  const control = await lab.runOnce(424242, 400, (fleet) => lab.boundaryCases(0, fleet));
   const controlInv = (await lab.checkInvariants(control)).filter((i) => !i.pass);
   const controlBounds = lab.checkBoundaries(control).filter((b) => !b.pass);
   if (controlInv.length || controlBounds.length) {

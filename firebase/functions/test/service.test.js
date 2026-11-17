@@ -2,37 +2,51 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { DEMO_SECRET, OrderError, sign, hashPacket } = require("../packet");
+const { OrderError, sign, hashPacket, verifyConfirmation } = require("../packet");
+const { requestKey, responseKey } = require("../keys");
 const { MemoryStore } = require("../store");
+const { MemoryKeyStore } = require("../keystore");
 const { demoHoldings } = require("../engine");
 const { TradeRescue } = require("../service");
 
 const NOW = 1700000000;
 const CAP = 15 * 60; // the server's MAX_VALIDITY_SECONDS
 
-/** A correctly signed v2 wire packet, overridable field by field. */
+// One enrolled device, fixed so the packets below are reproducible. A real
+// device gets its secret from the server at enrollment and no two share
+// one; the key lifecycle has its own suite in keys.test.js.
+const KEY_ID = "a1b2c3d4";
+const SECRET = Buffer.from("0123456789abcdef".repeat(4), "hex");
+const REQ = requestKey(SECRET);
+
+/** A correctly signed TRX3 wire packet, overridable field by field. */
 function packet(fields = {}) {
   const f = {
-    txId: "TRX0A1B2C", userId: "U10021", action: "S", symbol: "RELIANCE",
+    keyId: KEY_ID, txId: "TRX0A1B2C", userId: "U10021", action: "S", symbol: "RELIANCE",
     qty: 5, orderType: "I", floorPaise: 0, expiresAt: NOW + 600,
     nonce: "deadbeef", timestamp: NOW, ...fields,
   };
   const middle = [
-    "TRX2", f.txId, f.userId, f.action, f.symbol, String(f.qty), f.orderType,
+    "TRX3", f.keyId, f.txId, f.userId, f.action, f.symbol, String(f.qty), f.orderType,
     String(f.floorPaise), String(f.expiresAt), f.nonce, String(f.timestamp),
   ].join("|");
-  return `${middle}|${sign(DEMO_SECRET, middle)}`;
+  return `${middle}|${sign(f.signWith || REQ, middle)}`;
 }
 
 /**
- * A service on a fresh in-memory store, with a clock the test moves by
- * hand: `clock.t = ...` is how a packet is pushed past its expiry without
- * the test waiting fifteen minutes to find out.
+ * A service on fresh in-memory stores with one device enrolled, and a clock
+ * the test moves by hand: `clock.t = ...` is how a packet is pushed past
+ * its expiry without the test waiting fifteen minutes to find out.
  */
-function newApp(startAt = NOW + 60) {
+async function newApp(startAt = NOW + 60) {
   const store = new MemoryStore();
+  const keyStore = new MemoryKeyStore();
+  await keyStore.put({
+    keyId: KEY_ID, userId: "U10021", secret: SECRET,
+    status: "active", rotatedAt: null, replacedBy: null, createdAt: NOW,
+  });
   const clock = { t: startAt };
-  return { store, clock, app: new TradeRescue({ store, now: () => clock.t }) };
+  return { store, keyStore, clock, app: new TradeRescue({ store, keyStore, now: () => clock.t }) };
 }
 
 /**
@@ -48,7 +62,7 @@ const held = (store, symbol = "RELIANCE") =>
 // ---------------------------------------------------------------------------
 
 test("a signed packet sells, records the order, and reduces the holding", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const r = await app.executePacket(packet(), "SMS", "+919876543210");
 
   assert.strictEqual(r.status, "FILLED");
@@ -64,7 +78,7 @@ test("a signed packet sells, records the order, and reduces the holding", async 
 });
 
 test("two different packets both execute and both reduce the holding", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await app.executePacket(packet({ txId: "TRXAAA111", nonce: "aaaa1111", qty: 5 }), "SMS", null);
   await app.executePacket(packet({ txId: "TRXBBB222", nonce: "bbbb2222", qty: 3 }), "SMS", null);
 
@@ -73,7 +87,7 @@ test("two different packets both execute and both reduce the holding", async () 
 });
 
 test("the emergency path refuses a buy and a non-IOC order type", async () => {
-  const { app } = newApp();
+  const { app } = await newApp();
   await assert.rejects(() => app.executePacket(packet({ action: "B" }), "SMS", null), {
     status: 400, code: "NOT_SELL",
   });
@@ -83,7 +97,7 @@ test("the emergency path refuses a buy and a non-IOC order type", async () => {
 });
 
 test("a floor above the market price cancels rather than fills", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await assert.rejects(
     () => app.executePacket(packet({ floorPaise: 150000 }), "SMS", null),
     { status: 409, code: "BELOW_FLOOR" },
@@ -96,7 +110,7 @@ test("a floor above the market price cancels rather than fills", async () => {
 // ---------------------------------------------------------------------------
 
 test("the same tx_id with the same bytes replays the stored result", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const wire = packet();
   const first = await app.executePacket(wire, "SMS", null);
   const second = await app.executePacket(wire, "SMS", null);
@@ -108,7 +122,7 @@ test("the same tx_id with the same bytes replays the stored result", async () =>
 });
 
 test("the same tx_id with different bytes is a conflict, not someone else's result", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await app.executePacket(packet({ qty: 5 }), "SMS", null);
 
   // Same tx_id, legitimately signed, but a different order.
@@ -126,7 +140,7 @@ test("the same tx_id with different bytes is a conflict, not someone else's resu
 });
 
 test("a replay is matched on the packet hash, so gateway whitespace still replays", async () => {
-  const { app } = newApp();
+  const { app } = await newApp();
   const wire = packet();
   const first = await app.executePacket(wire, "SMS", null);
   const second = await app.executePacket(`  ${wire}\n`, "SMS", null);
@@ -135,7 +149,7 @@ test("a replay is matched on the packet hash, so gateway whitespace still replay
 });
 
 test("the stored record keeps the hash of the packet that claimed the tx_id", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const wire = packet();
   await app.executePacket(wire, "SMS", null);
   const [order] = await store.listOrders(10);
@@ -147,7 +161,7 @@ test("the stored record keeps the hash of the packet that claimed the tx_id", as
 // ---------------------------------------------------------------------------
 
 test("a forged packet is refused, recorded, and changes nothing", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const tampered = packet().replace("|5|", "|20|");
   await assert.rejects(() => app.executePacket(tampered, "SMS", "+919876543210"), {
     status: 401, code: "BAD_SIGNATURE",
@@ -162,7 +176,7 @@ test("a forged packet is refused, recorded, and changes nothing", async () => {
 });
 
 test("a forgery cannot burn the tx_id the real device is about to use", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   // An attacker who knows the tx_id but not the key tries to claim it.
   await assert.rejects(
     () => app.executePacket(packet({ qty: 99 }).replace(/\|[0-9a-f]{32}$/, "|" + "0".repeat(32)), "SMS", null),
@@ -180,7 +194,7 @@ test("a forgery cannot burn the tx_id the real device is about to use", async ()
 test("a malformed but correctly signed packet is terminal and does claim its tx_id", async () => {
   // It passed the signature, so it came from the keyholder: it gets an
   // answer that never changes, unlike a forgery which gets no record.
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const bad = packet({ symbol: "RELIANCE!" });
   await assert.rejects(() => app.executePacket(bad, "SMS", null), { status: 400, code: "MALFORMED" });
   // MALFORMED is caught at the signature stage's shape check, before the
@@ -194,7 +208,7 @@ test("a malformed but correctly signed packet is terminal and does claim its tx_
 // ---------------------------------------------------------------------------
 
 test("a duplicate arriving after expiry gets the original fill, not EXPIRED", async () => {
-  const { store, clock, app } = newApp();
+  const { store, clock, app } = await newApp();
   const wire = packet();
   const first = await app.executePacket(wire, "SMS", null);
 
@@ -210,7 +224,7 @@ test("a duplicate arriving after expiry gets the original fill, not EXPIRED", as
 });
 
 test("a packet first seen after its expiry is refused", async () => {
-  const { store, app } = newApp(NOW + 601);
+  const { store, app } = await newApp(NOW + 601);
   await assert.rejects(() => app.executePacket(packet({ expiresAt: NOW + 600 }), "SMS", null), {
     status: 400, code: "EXPIRED",
   });
@@ -219,17 +233,17 @@ test("a packet first seen after its expiry is refused", async () => {
 
 test("the server's validity cap expires a packet that asked for longer", async () => {
   // expires_at asks for a day; the cap allows fifteen minutes.
-  const { app } = newApp(NOW + CAP + 1);
+  const { app } = await newApp(NOW + CAP + 1);
   await assert.rejects(() => app.executePacket(packet({ expiresAt: NOW + 86400 }), "SMS", null), {
     status: 400, code: "EXPIRED",
   });
   // One second inside the cap still fills.
-  const ok = newApp(NOW + CAP - 1);
+  const ok = await newApp(NOW + CAP - 1);
   assert.strictEqual((await ok.app.executePacket(packet({ expiresAt: NOW + 86400 }), "SMS", null)).status, "FILLED");
 });
 
 test("a packet from the future is refused", async () => {
-  const { app } = newApp(NOW - 300);
+  const { app } = await newApp(NOW - 300);
   await assert.rejects(() => app.executePacket(packet(), "SMS", null), { status: 400, code: "CLOCK_SKEW" });
 });
 
@@ -253,7 +267,7 @@ test("each refusal for a validly signed packet is stored and replayed verbatim",
   ];
 
   for (const [code, fields, at, status, seed] of cases) {
-    const { store, app } = newApp(at);
+    const { store, app } = await newApp(at);
     if (seed) await store.setUserHoldings("U10021", seed);
     const expected = seed ? seed.RELIANCE.qty : demoHoldings().RELIANCE.qty;
     const wire = packet(fields);
@@ -287,7 +301,7 @@ test("each refusal for a validly signed packet is stored and replayed verbatim",
 });
 
 test("a terminal refusal is not re-decided, even once the world has changed", async () => {
-  const { store, clock, app } = newApp();
+  const { store, clock, app } = await newApp();
   const wire = packet({ floorPaise: 150000 });
   await assert.rejects(() => app.executePacket(wire, "SMS", null), { code: "BELOW_FLOOR" });
 
@@ -304,7 +318,7 @@ test("a terminal refusal is not re-decided, even once the world has changed", as
 });
 
 test("an expired refusal is not re-decided if the clock comes back in range", async () => {
-  const { store, clock, app } = newApp(NOW + 601);
+  const { store, clock, app } = await newApp(NOW + 601);
   const wire = packet({ expiresAt: NOW + 600 });
   await assert.rejects(() => app.executePacket(wire, "SMS", null), { code: "EXPIRED" });
 
@@ -318,7 +332,7 @@ test("an expired refusal is not re-decided if the clock comes back in range", as
 // ---------------------------------------------------------------------------
 
 test("ten concurrent copies of a packet fill once and replay the identical result", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const wire = packet();
 
   const results = await Promise.all(
@@ -343,7 +357,7 @@ test("ten concurrent copies of a packet fill once and replay the identical resul
 });
 
 test("ten concurrent copies of a refused packet all get the same refusal", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const wire = packet({ floorPaise: 150000 });
 
   const settled = await Promise.allSettled(
@@ -359,7 +373,7 @@ test("ten concurrent copies of a refused packet all get the same refusal", async
 });
 
 test("concurrent packets with different tx_ids all execute", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const wires = Array.from({ length: 4 }, (_, i) =>
     packet({ txId: `TRXCON00${i}`, nonce: `cafe000${i}`, qty: 2 }));
 
@@ -374,7 +388,7 @@ test("concurrent packets with different tx_ids all execute", async () => {
 // ---------------------------------------------------------------------------
 
 test("the same packet over two channels is one order, keeping the original channel", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const wire = packet();
   const viaSms = await app.executePacket(wire, "SMS", "+919876543210");
   const viaHttp = await app.executePacket(wire, "HTTP_FALLBACK", null);
@@ -385,38 +399,97 @@ test("the same packet over two channels is one order, keeping the original chann
   assert.strictEqual(await held(store), 15);
 });
 
-test("an inbound SMS gets a one-segment confirmation, and a refusal says nothing was sold", async () => {
-  const { app } = newApp();
+test("an inbound SMS gets a signed, one-segment confirmation", async () => {
+  const { app } = await newApp();
   const ok = await app.handleInboundSms(packet(), "+919876543210");
   assert.strictEqual(ok.status, "FILLED");
-  assert.match(ok.reply, /SOLD 5 RELIANCE/);
+  assert.strictEqual(ok.signed, true);
   assert.ok(ok.reply.length <= 160, `confirmation was ${ok.reply.length} chars`);
   assert.match(ok.reply, /^[\x20-\x7e]+$/, "must be plain ASCII to stay one segment");
 
-  const bad = await app.handleInboundSms("not a packet", "+919876543210");
-  assert.strictEqual(bad.status, "REJECTED");
-  assert.match(bad.reply, /nothing was sold/);
-  assert.ok(bad.reply.length <= 160, `refusal was ${bad.reply.length} chars`);
+  // The app will not believe a word of this until it verifies, so the test
+  // verifies it the same way rather than matching on the prose.
+  const seen = verifyConfirmation(ok.reply, responseKey(SECRET));
+  assert.ok(seen, "the reply must verify against the device's response key");
+  assert.strictEqual(seen.status, "FILLED");
+  assert.strictEqual(seen.quantity, 5);
+  assert.strictEqual(seen.symbol, "RELIANCE");
+  assert.strictEqual(seen.txId, "TRX0A1B2C");
+  assert.strictEqual(seen.remaining, 15);
+});
+
+test("a refusal from a known device is signed and names the reason", async () => {
+  const { app } = await newApp();
+  const r = await app.handleInboundSms(packet({ floorPaise: 150000 }), "+919876543210");
+  assert.strictEqual(r.status, "REJECTED");
+  assert.strictEqual(r.signed, true);
+  const seen = verifyConfirmation(r.reply, responseKey(SECRET));
+  assert.ok(seen, "a refusal must be signed too, or it can be forged");
+  assert.strictEqual(seen.status, "BELOW_FLOOR");
+  assert.strictEqual(seen.txId, "TRX0A1B2C");
+});
+
+test("a reply to an unidentifiable sender is unsigned and says nothing", async () => {
+  // No key means nothing to sign with, and the number is unauthenticated:
+  // the reply must not confirm or deny what was asked for.
+  const { app } = await newApp();
+  for (const junk of ["not a packet", packet({ keyId: "00000000" })]) {
+    const r = await app.handleInboundSms(junk, "+919876543210");
+    assert.strictEqual(r.status, "REJECTED");
+    assert.strictEqual(r.signed, false);
+    assert.strictEqual(verifyConfirmation(r.reply, responseKey(SECRET)), null);
+    assert.doesNotMatch(r.reply, /RELIANCE|SOLD \d/, "must not leak what the packet asked for");
+    assert.ok(r.reply.length <= 160);
+  }
 });
 
 test("a resent SMS gets the same confirmation as the first one", async () => {
-  const { app } = newApp();
+  const { clock, app } = await newApp();
   const wire = packet();
   const first = await app.handleInboundSms(wire, "+919876543210");
   const again = await app.handleInboundSms(wire, "+919876543210");
   assert.strictEqual(again.status, "FILLED");
   assert.strictEqual(again.reply, first.reply, "the user who missed the first reply gets it, not an error");
+
+  // Even minutes later: the confirmation carries the original fill, and its
+  // timestamp is the one the order was decided at, not the retry's.
+  clock.t += 300;
+  const later = await app.handleInboundSms(wire, "+919876543210");
+  assert.strictEqual(later.reply, first.reply);
 });
 
 test("the longest refusal message still fits one SMS segment", async () => {
-  const { app } = newApp();
-  const r = await app.handleInboundSms(packet({ symbol: "BAJAJFINSV", floorPaise: 999999999 }), "+919876543210");
+  const { app } = await newApp();
+  const r = await app.handleInboundSms(
+    packet({ symbol: "BAJAJFINSV", floorPaise: 999999999, txId: "T".repeat(12) }), "+919876543210",
+  );
   assert.strictEqual(r.status, "REJECTED");
   assert.ok(r.reply.length <= 160, `refusal was ${r.reply.length} chars: ${r.reply}`);
 });
 
+test("an outcome never serialises key material", async () => {
+  // This result goes straight to res.json() on the HTTP fallback path. If
+  // the response sub-key were an ordinary property, anybody who posted a
+  // packet would be handed what they need to forge confirmations to that
+  // phone.
+  const { app } = await newApp();
+  const r = await app.executePacket(packet(), "HTTP_FALLBACK", null);
+  const json = JSON.stringify(r);
+  assert.doesNotMatch(json, /responseKey|device/, `leaked: ${json}`);
+  assert.doesNotMatch(json, /[0-9a-f]{40}/, "no key-shaped hex may appear");
+  assert.deepStrictEqual(Object.keys({ ...r }).filter((k) => /key/i.test(k)), []);
+  // ...while the caller that needs it still has it.
+  assert.ok(Buffer.isBuffer(r.responseKey), "the signer still gets the key");
+
+  // The same for a refusal, which carries the key the same way.
+  const refused = await app.executePacket(packet({ floorPaise: 150000, txId: "TRXFLOOR9" }), "SMS", null)
+    .then(() => null, (e) => e);
+  assert.ok(Buffer.isBuffer(refused.responseKey));
+  assert.doesNotMatch(JSON.stringify(refused), /[0-9a-f]{40}/);
+});
+
 test("the direct path works and mints its own tx id", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   const r = await app.placeDirectOrder({ userId: "U10021", symbol: "TCS", qty: 2 });
   assert.strictEqual(r.status, "FILLED");
   assert.match(r.tx_id, /^TRX[0-9A-F]{6}$/);
@@ -425,7 +498,7 @@ test("the direct path works and mints its own tx id", async () => {
 });
 
 test("a refusal on the direct path is immediate and stores nothing", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await assert.rejects(() => app.placeDirectOrder({ userId: "U10021", symbol: "TCS", qty: 99 }), {
     code: "INSUFFICIENT",
   });
@@ -433,7 +506,7 @@ test("a refusal on the direct path is immediate and stores nothing", async () =>
 });
 
 test("an unknown user is refused on the portfolio and the demo user is not", async () => {
-  const { app } = newApp();
+  const { app } = await newApp();
   await assert.rejects(() => app.getPortfolio("U99999"), { status: 404, code: "UNKNOWN_USER" });
   const p = await app.getPortfolio("U10021");
   assert.deepStrictEqual(p.holdings[0], {
@@ -442,7 +515,7 @@ test("an unknown user is refused on the portfolio and the demo user is not", asy
 });
 
 test("the admin overview masks the sender and reports what the checks stopped", async () => {
-  const { app } = newApp();
+  const { app } = await newApp();
   await app.executePacket(packet(), "SMS", "+919876543210");
   await app.executePacket(packet().replace("|5|", "|20|"), "SMS", "+919876543210").catch(() => {});
 
@@ -457,7 +530,7 @@ test("the admin overview masks the sender and reports what the checks stopped", 
 });
 
 test("the ledger shows refused orders alongside filled ones", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await app.executePacket(packet({ txId: "TRXFILL01" }), "SMS", null);
   await app.executePacket(packet({ txId: "TRXFLOOR1", nonce: "cafe0002", floorPaise: 150000 }), "SMS", null)
     .catch(() => {});
@@ -468,7 +541,7 @@ test("the ledger shows refused orders alongside filled ones", async () => {
 });
 
 test("reset puts the starting portfolio back and clears the history", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await app.executePacket(packet(), "SMS", null);
   await app.resetDemo();
 
@@ -486,7 +559,7 @@ test("reset puts the starting portfolio back and clears the history", async () =
 // ---------------------------------------------------------------------------
 
 test("the store hands out holdings by value, so a caller cannot mutate it", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await app.executePacket(packet(), "SMS", null);
 
   const holdings = await store.getUserHoldings("U10021");
@@ -495,7 +568,7 @@ test("the store hands out holdings by value, so a caller cannot mutate it", asyn
 });
 
 test("a failing transaction does not wedge the queue behind it", async () => {
-  const { store, app } = newApp();
+  const { store, app } = await newApp();
   await assert.rejects(
     () => app.executePacket(packet({ symbol: "WIPRO", txId: "TRXBAD001" }), "SMS", null),
     { code: "UNKNOWN_SYMBOL" },
