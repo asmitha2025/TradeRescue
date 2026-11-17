@@ -29,6 +29,15 @@ class SmsGatewayReceiver : BroadcastReceiver() {
         val parts = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
         val from = parts.firstOrNull()?.originatingAddress ?: return
         val text = parts.joinToString("") { it.messageBody.orEmpty() }.trim()
+        // A confirmation coming back from the server. Handed to the app,
+        // which verifies the signature before it believes any of it; this
+        // receiver deliberately does no checking of its own, so there is
+        // one place where that decision is made.
+        if (Confirmation.looksLikeConfirmation(text)) {
+            confirmationListener?.invoke(text)
+            return
+        }
+
         // Taken from the packet format rather than written out, so a
         // version bump cannot leave the gateway silently dropping every
         // real packet.
@@ -95,6 +104,17 @@ class SmsGatewayReceiver : BroadcastReceiver() {
     }
 
     companion object {
+        /**
+         * Set by the app while it is open, so an arriving confirmation can
+         * reach the screen that is waiting for it. Null when the app is
+         * not running: a confirmation that arrives then is simply an SMS
+         * in the inbox, which is the honest outcome -- the app will not
+         * claim an order executed on the strength of a message it never
+         * verified.
+         */
+        @Volatile
+        var confirmationListener: ((String) -> Unit)? = null
+
         private const val TAG = "SmsGateway"
         private val handled = LinkedHashSet<String>()
         const val PREFS = "settings"

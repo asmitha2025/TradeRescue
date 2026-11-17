@@ -55,6 +55,14 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // Needed for BiometricPrompt: Phase 3 requires the user to be present
+    // for every order signature, with the device credential (PIN, pattern,
+    // password) accepted as well as a fingerprint.
+    implementation("androidx.biometric:biometric:1.1.0")
+    // biometric:1.1.0 drags in fragment 1.2.x, which predates the
+    // ActivityResult APIs MainActivity uses for the SMS permission. Pinned
+    // forward so the two can coexist.
+    implementation("androidx.fragment:fragment-ktx:1.8.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 

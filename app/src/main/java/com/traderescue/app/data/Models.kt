@@ -21,22 +21,28 @@ fun demoHoldings(): List<Holding> = listOf(
 /**
  * The compact, SMS-sized emergency packet:
  *
- *   TRX2|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+ *   TRX3|key_id|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+ *
+ * `key_id` names the device key that signed this packet, so the server
+ * knows which key to check against before it checks anything else. Every
+ * device has its own, handed over once at enrollment; there is no longer
+ * any secret shared by every install.
  *
  * action is "S"/"B" and order_type is "I" for immediate-or-cancel, the only
  * type the emergency channel places: it fills at the available price or not
  * at all. `floor` is a price floor in paise, 0 meaning "exit at any price",
  * which keeps the comparison off floating point on both sides.
  *
- * The version is field 0 and is covered by the signature, so a v1 TRX
- * packet cannot be passed off as a v2 one by rewriting its prefix -- it
- * fails the signature check and is refused cleanly.
+ * The version is field 0 and is covered by the signature, so an older TRX
+ * or TRX2 packet cannot be passed off as a v3 one -- it fails on the field
+ * count and, failing that, on the signature.
  *
  * Identical to packet.js on the backend, which is what makes a packet built
  * here verify there. PacketTest.kt and test/packet.test.js pin the same
  * reference packet, so a change on either side fails a test on that side.
  */
 data class EmergencyPacket(
+    val keyId: String,
     val txId: String,
     val userId: String,
     val action: String,
@@ -50,14 +56,14 @@ data class EmergencyPacket(
 ) {
     fun signingPayload(): String =
         listOf(
-            VERSION, txId, userId, action, symbol, qty.toString(), orderType,
+            VERSION, keyId, txId, userId, action, symbol, qty.toString(), orderType,
             floorPaise.toString(), expiresAt.toString(), nonce, timestamp.toString(),
         ).joinToString("|")
 
     fun toWire(signature: String): String = "${signingPayload()}|$signature"
 
     companion object {
-        const val VERSION = "TRX2"
+        const val VERSION = "TRX3"
 
         /** Immediate-or-cancel: the only order type the emergency path takes. */
         const val ORDER_TYPE_IOC = "I"
@@ -82,10 +88,13 @@ data class EmergencyPacket(
          * these are not style preferences: they are the character budget
          * that keeps the whole packet inside one segment, and the two ends
          * have to agree on them.
+         *
+         * key_id cost 8 characters plus a separator in TRX3. The nonce paid
+         * most of that back, dropping from 16 to 12.
          */
         val LIMITS = mapOf(
-            "txId" to 12, "userId" to 12, "symbol" to 16, "qty" to 9,
-            "floorPaise" to 10, "expiresAt" to 11, "nonce" to 16, "timestamp" to 11,
+            "keyId" to 8, "txId" to 12, "userId" to 12, "symbol" to 16, "qty" to 9,
+            "floorPaise" to 10, "expiresAt" to 11, "nonce" to 12, "timestamp" to 11,
         )
 
         /** The longest packet the backend's shape checks will accept. */
@@ -93,10 +102,11 @@ data class EmergencyPacket(
             VERSION.length +
                 LIMITS.values.sum() +
                 2 + // action and order_type, one character each
-                11 + // the | separators
+                12 + // the | separators
                 32 // the truncated HMAC
 
         fun build(
+            keyId: String,
             userId: String,
             action: String,
             symbol: String,
@@ -106,6 +116,7 @@ data class EmergencyPacket(
             nowSeconds: Long = System.currentTimeMillis() / 1000,
         ): EmergencyPacket =
             EmergencyPacket(
+                keyId = keyId,
                 txId = "TRX" + PacketSigner.randomHex(3).uppercase(),
                 userId = userId,
                 action = action,

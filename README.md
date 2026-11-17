@@ -22,7 +22,8 @@ GitHub Pages.
 **It is a simulation of the server checks, not the backend running in your
 browser.** The page contains a second implementation in JavaScript that
 mirrors `firebase/functions/` — the same checks in the same order — so you
-can watch each one decide. The TRX2 format, the HMAC signing, the tx_id
+can watch each one decide. The TRX3 format, per-device keys and their two
+HKDF-derived sub-keys, the HMAC signing, the tx_id
 ledger, expiry, limits and the floor behave as the real server does; the
 SMS hop, Firestore and the exchange are simulated, the ledger lives in the
 tab and resets with the page, and no broker is involved.
@@ -49,17 +50,22 @@ Phone ──── HTTPS /order ────► Backend      Phone ── SMS �
                                            (signed packet)   /webhook/twilio-sms
 ```
 
-The packet (version 2), identical in the Android app's `Models.kt` and the
+The packet (version 3), identical in the Android app's `Models.kt` and the
 backend's `packet.js`:
 
 ```
-TRX2|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
-TRX2|TRX0A1B2C|U10021|S|RELIANCE|5|I|148000|1700001800|deadbeef|1700000000|bb983dacfcd5053a247949e396fd4dcf
+TRX3|key_id|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+TRX3|a1b2c3d4|TRX0A1B2C|U10021|S|RELIANCE|5|I|148000|1700001800|deadbeef|1700000000|80882aab5f00c74589a2271b52679701
 ```
 
-- `signature` is HMAC-SHA256 over the eleven preceding fields, truncated to
-  32 hex characters. The version is field 0 and is signed, so a v1 `TRX`
-  packet cannot be relabelled as v2 — it fails the signature check.
+- `key_id` names the device key that signed this packet. The server reads
+  it before it checks anything else, because it cannot check a signature
+  without knowing which key to check against. It is inside the signed
+  payload, so a packet cannot be pointed at a different device's key.
+- `signature` is HMAC-SHA256 over the twelve preceding fields, truncated to
+  32 hex characters, using this device's **request sub-key** (below). The
+  version is field 0 and is signed, so an older `TRX` or `TRX2` packet
+  cannot be relabelled as v3.
 - `order_type` is `I`: immediate-or-cancel. The emergency path fills at the
   available price or not at all. Nothing rests, because a resting order is
   the wrong shape for an exit you need *now*.
@@ -78,17 +84,100 @@ TRX2|TRX0A1B2C|U10021|S|RELIANCE|5|I|148000|1700001800|deadbeef|1700000000|bb983
 - Each holding has a pre-authorized emergency limit, enforced on the server
   as well as in the app.
 
+### Per-device keys
+
+There is no secret shared by every install. A device enrolls once while
+online, over HTTPS, and the server hands it a 32-byte secret. Both ends
+then derive **two sub-keys** from it with HKDF-SHA256 under direction
+labels:
+
+| Sub-key | Label | Signs | User present? |
+|---|---|---|---|
+| request | `TRX3-req` | order packets, on the phone | yes, every time |
+| response | `TRX3-resp` | confirmations, on the server | n/a |
+
+The split is what makes a reflected confirmation harmless. A reply signed
+with the response key simply **is not** a valid order signature, so it
+cannot be fed back in as an order — no check has to remember to look for
+that case. The same holds in reverse: a message signed with the request key
+is not a confirmation the app will believe.
+
+On the phone both sub-keys go into the Android Keystore, StrongBox-backed
+where the hardware supports importing such a key. The device secret itself
+is never stored: it lives in memory long enough to derive the two sub-keys
+and is then overwritten. The request sub-key requires user authentication
+on **every** use — biometric **or** the device credential, because a phone
+with no enrolled fingerprint, or a wet thumb in the rain, must still have
+an emergency exit. The response sub-key requires none: a confirmation
+arrives whenever the network feels like it, there is no user to prompt, and
+reading one authorises nothing.
+
+**The server holds every device's key and could forge that device's
+packets.** This is an HMAC, so the server must hold the same secret to
+verify a signature. What the Keystore protects is *use* of the key on the
+phone — nobody who picks it up can sign an order without your face or your
+PIN — not its secrecy from the backend. Asymmetric signatures would remove
+that trust and are out of scope: an ECDSA P-256 signature is 128 hex
+characters, which pushes the packet to roughly 204 and breaks the
+one-segment guarantee. Noted as future work.
+
+### Revocation and rotation
+
+Both online only.
+
+- **Revocation** is immediate, with no grace period. A revoked key's
+  packets are refused exactly the way a forgery is.
+- **Rotation** issues a new key and starts a grace window on the old one of
+  one maximum packet lifetime (15 minutes). A packet already in flight was
+  signed in good faith, and SMS is store-and-forward, so cutting the key
+  off at the instant of rotation would throw away honest orders. The
+  boundary is tested at the second and is **inclusive**, matching
+  `expires_at`.
+- Unknown, revoked and expired-rotated keys, and a genuine key signing for
+  a different user, are all refused **before the ledger**: no `tx_id`
+  claimed, a rejection log entry and nothing else.
+
+### Signed confirmations
+
+The server signs its reply with the device's response sub-key:
+
+```
+TradeRescue: SOLD 5 RELIANCE @Rs1485.20 (15 left) Ref TRX0A1B2C 1700000060 #3186ddf82c2b14ca
+TradeRescue: NOT SOLD (EXPIRED) Ref TRX0A1B2C 1700000060 #a0c1...
+```
+
+The app verifies the tag before it changes anything on screen. Only then
+does the status move from **Sent** to **Executed**. A reply that arrives
+but does not verify is shown as **"Unverified message"** and is never
+allowed to read as a fill — anybody who knows the phone number can send a
+text, and only the broker can sign one.
+
+The reply had to shrink to make room for the tag, and now carries epoch
+seconds rather than a formatted date: a localised string is a poor thing to
+sign, varying by server locale and able to carry characters that push the
+message out of GSM-7 into two segments. The app renders a friendly time
+from it. Longest possible confirmation is 123 characters.
+
+Reading those replies needs `RECEIVE_SMS`, which Google Play treats as a
+**restricted permission**: fine for a portfolio project installed by
+sideload, not shippable to the Play Store as-is.
+
 ### Exactly once
 
 `tx_id` is the idempotency key, and every field limit above is a character
 budget rather than a preference: the longest packet the server will accept
-is 146 characters, which is what keeps the one-segment guarantee a property
-of the format instead of a habit of the current client.
+is 151 characters, which is what keeps the one-segment guarantee a property
+of the format instead of a habit of the current client. (`key_id` cost 8
+characters plus a separator when TRX3 added it; the nonce paid most of that
+back, dropping from 16 to 12.)
 
-1. **Signature first.** A forged or malformed packet produces a rejection
-   log entry and nothing else. It can never create or claim a `tx_id`, so
-   an attacker who learns a `tx_id` cannot burn it before the real device
-   uses it.
+1. **The key, then the signature.** The key id is read first, because a
+   signature cannot be checked without knowing which key to check against.
+   An unknown, revoked or long-rotated key stops there. A forged or
+   malformed packet stops at the signature. Either way it produces a
+   rejection log entry and nothing else, and can never create or claim a
+   `tx_id` — so an attacker who learns a `tx_id` cannot burn it before the
+   real device uses it.
 2. **Then the `tx_id` lookup.** A `tx_id` already on the ledger replays its
    stored outcome. Same `tx_id` with different bytes (matched on a SHA-256
    of the packet) is a conflict, and gets an error rather than somebody
@@ -168,7 +257,10 @@ app/src/main/java/com/traderescue/app/
 ├── MainActivity.kt        entry point; requests SEND_SMS
 ├── AppViewModel.kt        screen state, connectivity, the execute() flow
 ├── data/
-│   ├── Models.kt          Holding, EmergencyPacket (the TRX2 format)
+│   ├── Models.kt          Holding, EmergencyPacket (the TRX3 format)
+│   ├── Hkdf.kt            HKDF-SHA256 sub-key derivation
+│   ├── DeviceKeys.kt      Keystore-held per-device keys (+ memory fake)
+│   ├── Confirmation.kt    parses and verifies the server's signed reply
 │   ├── PacketSigner.kt    HMAC-SHA256
 │   ├── BackendApi.kt      OkHttp calls to /order and /emergency/sms
 │   └── SmsSender.kt       SmsManager call + sent-status confirmation
@@ -198,8 +290,11 @@ transaction reaches Google, and no share changes hands.
 Faults injected: dropped, duplicated (sequentially and concurrently, up to
 ten copies racing in the same instant), reordered, delayed past expiry,
 tampered with after signing, a second correctly signed packet reusing a
-tx_id for a different order, and a client clock running ahead both inside
-and beyond the two-minute backstop. A clean control group is included,
+tx_id for a different order, a client clock running ahead both inside and
+beyond the two-minute backstop, and five key faults — a revoked key, a
+never-enrolled key, another device's key, a packet in flight across a
+rotation both inside and outside the grace window, and a server
+confirmation fed back in as if it were an order. A clean control group is included,
 because a lab that only ever sees broken deliveries proves nothing about
 working ones.
 
@@ -210,23 +305,23 @@ by the command above:
 | | |
 |---|---|
 | Packets | 50,000 across 5 seeds (base seed `20261117`) |
-| Deliveries processed | 91,104 |
-| First-time decisions, **filled** (shares sold) | **27,804** |
-| First-time decisions, refused (on the ledger, nothing sold) | 16,160 |
-| Replays served (no new decision) | 39,169 |
-| Stopped before the ledger (forged or conflicting) | 7,971 |
-| Dropped before arrival | 4,045 |
-| Runtime | 2.9s |
-| Invariants | **all 7 held on all 5 seeds** |
+| Deliveries processed | 83,524 |
+| First-time decisions, **filled** (shares sold) | **23,232** |
+| First-time decisions, refused (on the ledger, nothing sold) | 14,471 |
+| Replays served (no new decision) | 31,947 |
+| Stopped before the ledger (forged, conflicting or a dead key) | 13,874 |
+| Dropped before arrival | 3,323 |
+| Runtime | 12.9s |
+| Invariants | **all 8 held on all 5 seeds** |
 | Boundary cases | **all matched** |
 
-The seven invariants are checked against the **final ledger**, not against
+The eight invariants are checked against the **final ledger**, not against
 what each call returned: at most one fill per tx_id; no fill where server
 time passed `expires_at`; no fill from an invalid signature; no conflicting
 packet executed; only one payload per tx_id ever answered, with others
 refused as conflicts; holdings never negative and final holdings exactly
 initial minus the sum of fills; and every replay identical to the stored
-outcome.
+outcome; and no fill from a revoked, unknown or wrong-direction key.
 
 `expires_at` is **inclusive**: the server refuses when
 `now > min(expires_at, timestamp + 15 minutes)`, so a packet arriving in the
@@ -237,8 +332,9 @@ seed.
 ### Why the self-check exists
 
 A lab that cannot fail is not evidence. `tools/lab-selfcheck.js` breaks the
-service four ways on purpose — removing the tx_id lookup, ignoring expiry,
-trusting every signature, and treating a conflicting tx_id as a replay — and
+service five ways on purpose — removing the tx_id lookup, ignoring expiry,
+trusting every signature, treating a conflicting tx_id as a replay, and
+accepting revoked and long-rotated keys — and
 fails if the matching invariant does not fire. It also runs the unmutated
 code first and fails if the lab reports problems with healthy code.
 
@@ -249,31 +345,52 @@ untouched, and the replay did match the record it had been wrongly copied
 from, so every check stayed quiet. The seventh invariant exists because of
 that hole.
 
+It paid for itself a second time in Phase 3. The `trust-signature` mutation
+had gone stale when parsing and verification were split into two functions:
+it patched a function the service no longer called, so it broke nothing,
+caught nothing, and still reported a pass. A self-check that silently stops
+testing is worse than none, which is why it now runs the unmutated code
+first and fails if the lab is quiet when it should not be.
+
 ## What is verified, and what isn't
 
 Only what a test actually produced is claimed here.
 
-**Verified by tests that run in this repo** — 58 backend tests
-(`npm test` in `firebase/functions`) and 12 Android unit tests
-(`gradlew.bat :app:testDebugUnitTest`), all passing:
+**Verified by tests that run in this repo** — 91 backend tests
+(`npm test` in `firebase/functions`), 26 Android unit tests
+(`gradlew.bat :app:testDebugUnitTest`) and 36 demo-page checks
+(`node demo/check-demo.js`), all passing, plus `lintDebug` clean:
 
-- The HMAC matches a published test vector, and the full v2 wire packet
-  matches a signature pinned independently in both the Kotlin and the
-  JavaScript test suites, so a format change on either side fails a test on
-  that side.
-- The longest packet the server's own shape checks will accept is 146
-  characters, inside one 160-character GSM-7 segment. This is asserted
-  against the limits themselves, not against a sample packet.
-- A v1 `TRX` packet is refused, and relabelling one as `TRX2` fails the
-  signature check.
-- Exactly-once, on the terms described above: a replay returns the stored
-  result; a `tx_id` reused with different bytes is a conflict; a forged
-  packet creates no ledger record; a duplicate arriving after expiry gets
-  the original fill; ten concurrent copies of one packet produce one
-  execution and nine identical replays.
+- The HKDF derivation is pinned to the same two sub-key values in **three
+  independent implementations** — Node's `hkdfSync`, Kotlin's `Hkdf.kt` and
+  the demo page's WebCrypto — so the phone, the server and the demo cannot
+  drift apart silently.
+- The full v3 wire packet matches a signature pinned in both the Kotlin and
+  the JavaScript test suites, so a format change on either side fails a
+  test on that side.
+- The longest packet the server's own shape checks will accept is 151
+  characters, inside one 160-character GSM-7 segment, asserted against the
+  limits themselves rather than a sample packet. The longest possible
+  signed confirmation is 123.
+- Older `TRX` and `TRX2` packets are refused, and relabelling one fails.
+- Exactly-once: a replay returns the stored result; a `tx_id` reused with
+  different bytes is a conflict; a forged packet creates no ledger record;
+  a duplicate arriving after expiry gets the original fill; ten concurrent
+  copies produce one execution and nine identical replays.
 - Every terminal outcome is replayed rather than re-decided — a refusal
   stays refused even after the price rises above the floor or the clock
   comes back into range.
+- Keys: an unknown, revoked or expired-rotated key is refused before the
+  ledger and claims no `tx_id`; a genuine key signing for another user is
+  refused; an order signed with the response sub-key is refused; the
+  rotation grace boundary is checked at one second before, exactly at, and
+  one second after.
+- An outcome never serialises key material, so the HTTP fallback cannot
+  hand a caller the key needed to forge confirmations.
+- A confirmation verifies only against the right device's response sub-key:
+  altered text, a wrong tag, a missing tag, another device's key and the
+  request sub-key are each refused, and an unverifiable reply is never
+  shown as a fill.
 
 **Important caveat on where those proofs hold.** The guarantees above are
 proven against `MemoryStore`, the in-memory store adapter, which serializes
@@ -301,16 +418,13 @@ production store.
 
 ## Known limits (deliberate, for a demo)
 
-- The signing secret and PIN are constants in source — one secret shared by
-  every install. Phase 3 replaces it with a key provisioned per device at
-  enrollment and held in the Android Keystore, unlocked by biometrics or the
-  device credential. Note that the signature stays an HMAC, so the server
-  necessarily holds a copy of each device's key and could forge that
-  device's packets; what the Keystore protects is use of the key on the
-  phone, not its secrecy from the backend. Asymmetric signatures would fix
-  that and are out of scope: an ECDSA P-256 signature is 128 hex characters,
-  which puts the packet at roughly 204 and breaks the one-segment
-  guarantee.
+- The PIN is a constant in source, and so is the enrollment token. The
+  token is this demo's stand-in for the authenticated session a real
+  deployment would require before handing a device a key: **it is not
+  authentication**, and anyone holding it can enroll a device for any user.
+  Phase 4's login is what replaces it. The per-device signing keys
+  themselves are real — see "Per-device keys" above, including the part
+  about the server being able to forge them.
 - On the SMS channel the app shows **Order sent**, not *executed*: the
   radio confirmed the message, but the fill is confirmed by the backend,
   which an offline phone can't hear from. Phase 3 closes that loop with a

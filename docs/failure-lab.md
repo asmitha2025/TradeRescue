@@ -13,14 +13,14 @@ broker.** No packet crosses a radio and no transaction reaches Google.
 
 |  |  |
 |---|---|
-| Commit | `ec4efe4 (working tree dirty: 10 other file(s))` |
-| Date | 2026-11-17T09:24:46.443Z |
+| Commit | `83e0b49 (working tree dirty: 15 other file(s))` |
+| Date | 2026-11-17T09:42:11.575Z |
 | Base seed | `20261117` |
 | Seeds run | `20261117`, `20269036`, `20276955`, `20284874`, `20292793` |
 | Packets per seed | 10,000 |
 | Packets total | 50,000 |
 | Deliveries total | 83,524 |
-| Runtime | 12.9s |
+| Runtime | 5.9s |
 | Node | v24.13.1 |
 
 ## Result

@@ -14,11 +14,13 @@ import androidx.lifecycle.viewModelScope
 import com.traderescue.app.data.BackendApi
 import com.traderescue.app.data.EmergencyPacket
 import com.traderescue.app.data.Holding
-import com.traderescue.app.data.PacketSigner
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
-import com.traderescue.app.data.SIGNING_SECRET
+import com.traderescue.app.data.Confirmation
+import com.traderescue.app.data.DeviceKeys
+import com.traderescue.app.data.KeystoreDeviceKeys
 import com.traderescue.app.data.SmsGatewayReceiver
+import com.traderescue.app.data.signHex
 import com.traderescue.app.data.SmsSender
 import com.traderescue.app.data.demoHoldings
 import kotlinx.coroutines.delay
@@ -30,18 +32,35 @@ enum class Screen { DASHBOARD, SETTINGS, SELECT_HOLDING, QUANTITY, PIN, EXECUTIN
 enum class Channel { DIRECT, SMS, HTTP_FALLBACK, SIMULATED }
 
 /**
- * What the success screen shows. [confirmed] is false for the SMS channel:
- * the radio accepted the message, but the fill itself is confirmed by the
- * backend, which the phone can't reach while it is offline.
+ * How sure the app is that an order actually happened.
+ *
+ * SENT is the honest state for the SMS channel on its own: the radio
+ * accepted the message, which says nothing about whether it was executed.
+ * Only a confirmation whose signature verifies against this device's
+ * response sub-key moves it to EXECUTED. A reply that arrives but does not
+ * verify moves it to UNVERIFIED and is shown as an unverified message --
+ * never as a fill, however convincingly it is worded.
+ */
+enum class Confidence { SENT, EXECUTED, REFUSED, UNVERIFIED }
+
+/**
+ * What the success screen shows.
  */
 data class SaleResult(
     val symbol: String,
     val qty: Int,
     val price: Double,
     val channel: Channel,
-    val confirmed: Boolean,
+    val confidence: Confidence,
     val wirePacket: String?,
-)
+    val txId: String? = null,
+    /** The server's own words, once verified. Null until then. */
+    val confirmationText: String? = null,
+    /** Why the server refused, when it did. */
+    val refusalCode: String? = null,
+) {
+    val confirmed: Boolean get() = confidence == Confidence.EXECUTED
+}
 
 const val USER_ID = "U10021"
 const val DEMO_PIN = "1234"
@@ -56,6 +75,19 @@ private const val PIN_LOCK_SECONDS = 30
 class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences(SmsGatewayReceiver.PREFS, Context.MODE_PRIVATE)
     private val connectivity = app.getSystemService(ConnectivityManager::class.java)
+
+    /**
+     * This device's keys. Injectable so a test or a simulation run can hand
+     * in an in-memory pair instead of the Android Keystore, which needs a
+     * real device.
+     */
+    var deviceKeys: DeviceKeys = KeystoreDeviceKeys(app)
+
+    /** Set when the user must authenticate before an order can be signed. */
+    var authPrompt by mutableStateOf<(suspend () -> Boolean)?>(null)
+
+    val isEnrolled: Boolean get() = deviceKeys.isEnrolled
+    val deviceKeyId: String? get() = deviceKeys.keyId
 
     var screen by mutableStateOf(Screen.DASHBOARD)
         private set
@@ -99,6 +131,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     var wirePacket by mutableStateOf<String?>(null)
         private set
     var saleResult by mutableStateOf<SaleResult?>(null)
+
+    /** The order waiting for a signed confirmation, if any. */
+    var pendingTxId by mutableStateOf<String?>(null)
+        private set
+
+    /** What the Settings screen says about this device's enrollment. */
+    var enrollmentStatus by mutableStateOf("")
         private set
 
     /** Null until a sync is attempted; then whether the dashboard shows the server's numbers. */
@@ -282,11 +321,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                     if (api == null) {
                         log("No backend configured — simulating a direct order")
                         delay(900)
-                        finishSale(holding, qty, holding.price, Channel.SIMULATED, confirmed = true)
+                        finishSale(holding, qty, holding.price, Channel.SIMULATED, Confidence.EXECUTED)
                     } else {
                         log("Sending order over HTTPS")
                         api.placeNormalOrder(USER_ID, holding.symbol, "SELL", qty)
-                            .onSuccess { finishSale(holding, qty, it.optDouble("fill_price", holding.price), Channel.DIRECT, confirmed = true) }
+                            .onSuccess { finishSale(holding, qty, it.optDouble("fill_price", holding.price), Channel.DIRECT, Confidence.EXECUTED) }
                             .onFailure { execError = "Could not reach backend: ${it.message}" }
                     }
                     return@launch
@@ -294,17 +333,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
                 log("No data connection — switching to the emergency channel")
                 delay(500)
+
+                val keyId = deviceKeys.keyId
+                if (keyId == null) {
+                    // Enrollment needs the network, so it cannot be done
+                    // now. Saying so plainly beats failing obscurely.
+                    execError = "This device is not enrolled. Connect once while online to enroll it, " +
+                        "then the emergency channel will work offline."
+                    return@launch
+                }
+
                 val packet = EmergencyPacket.build(
-                    USER_ID, "S", holding.symbol, qty,
+                    keyId = keyId,
+                    userId = deviceKeys.userId ?: USER_ID,
+                    action = "S",
+                    symbol = holding.symbol,
+                    qty = qty,
                     // No floor: exit at any price. A floor is the user's
                     // choice, and the plans that let them set one arrive in
                     // Phase 4 -- until then the honest default for an
                     // emergency exit is to take the available price.
                     floorPaise = 0,
                 )
-                val wire = packet.toWire(PacketSigner.hmacSha256Hex(SIGNING_SECRET, packet.signingPayload()))
+
+                val signature = signPayload(packet.signingPayload())
+                if (signature == null) {
+                    execError = "The order was not signed, so nothing was sent."
+                    return@launch
+                }
+                val wire = packet.toWire(signature)
                 wirePacket = wire
-                log("Packet built & signed with HMAC-SHA256 (${wire.length} characters)")
+                log("Signed with this device's key ${keyId} (${wire.length} characters)")
                 log("Valid for ${EmergencyPacket.DEFAULT_VALIDITY_SECONDS / 60} minutes, then the server refuses it")
                 delay(500)
 
@@ -321,19 +380,24 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         SmsSender.send(getApplication(), smsDestinationNumber, wire)
                             .onSuccess {
                                 log("SMS accepted by the network → $smsDestinationNumber")
-                                finishSale(holding, qty, holding.price, Channel.SMS, confirmed = false)
+                                log("Waiting for a signed confirmation before calling this executed")
+                                pendingTxId = packet.txId
+                                finishSale(
+                                    holding, qty, holding.price, Channel.SMS,
+                                    Confidence.SENT, txId = packet.txId,
+                                )
                             }
                             .onFailure { execError = "SMS could not be sent: ${it.message}" }
                     }
                     api == null -> {
                         log("Real SMS skipped ($smsBlocker) — simulating the SMS gateway")
                         delay(900)
-                        finishSale(holding, qty, holding.price, Channel.SIMULATED, confirmed = true)
+                        finishSale(holding, qty, holding.price, Channel.SIMULATED, Confidence.EXECUTED)
                     }
                     else -> {
                         log("Real SMS skipped ($smsBlocker) — posting the same signed packet over HTTP")
                         api.postEmergencyPacket(wire)
-                            .onSuccess { finishSale(holding, qty, it.optDouble("fill_price", holding.price), Channel.HTTP_FALLBACK, confirmed = true) }
+                            .onSuccess { finishSale(holding, qty, it.optDouble("fill_price", holding.price), Channel.HTTP_FALLBACK, Confidence.EXECUTED) }
                             .onFailure { execError = "Could not reach the emergency gateway: ${it.message}" }
                     }
                 }
@@ -343,10 +407,104 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun finishSale(holding: Holding, qty: Int, fillPrice: Double, channel: Channel, confirmed: Boolean) {
+    private fun finishSale(
+        holding: Holding,
+        qty: Int,
+        fillPrice: Double,
+        channel: Channel,
+        confidence: Confidence,
+        txId: String? = null,
+    ) {
         holdings = holdings.map { if (it.symbol == holding.symbol) it.copy(qty = it.qty - qty) else it }
-        saleResult = SaleResult(holding.symbol, qty, fillPrice, channel, confirmed, wirePacket)
+        saleResult = SaleResult(holding.symbol, qty, fillPrice, channel, confidence, wirePacket, txId)
         screen = Screen.SUCCESS
+    }
+
+    /**
+     * Signs with this device's request sub-key, prompting for biometrics or
+     * the device credential when the Keystore asks for them.
+     *
+     * Returns null if the user cannot or will not authenticate, and the
+     * caller sends nothing: an order nobody authorised is not an order.
+     */
+    private suspend fun signPayload(payload: String): String? {
+        deviceKeys.requestMacOrNull()?.let { return it.signHex(payload) }
+
+        log("Confirm it is you")
+        val prompt = authPrompt
+        if (prompt == null) {
+            execError = "This device needs a screen lock or a fingerprint to authorise an order."
+            return null
+        }
+        if (!prompt()) {
+            log("Not authorised — nothing was sent")
+            return null
+        }
+        return deviceKeys.requestMacOrNull()?.signHex(payload)
+    }
+
+    /**
+     * An SMS arrived. If it verifies against this device's response
+     * sub-key, and it is about the order we are waiting on, the screen may
+     * finally say the order executed.
+     *
+     * Anything that does not verify is shown as an unverified message. It
+     * is never allowed to read as a fill, however convincingly it is
+     * worded: without the tag, anybody with the phone number could write it.
+     */
+    fun onSmsReceived(message: String) {
+        if (!Confirmation.looksLikeConfirmation(message)) return
+        val result = saleResult ?: return
+        val verified = deviceKeys.verifyConfirmation(message)
+
+        if (verified == null) {
+            saleResult = result.copy(confidence = Confidence.UNVERIFIED)
+            return
+        }
+        // A genuine confirmation for some other order is not this one's.
+        if (pendingTxId != null && verified.txId != pendingTxId) return
+
+        saleResult = if (verified.isFill) {
+            result.copy(
+                confidence = Confidence.EXECUTED,
+                price = verified.fillPrice ?: result.price,
+                qty = verified.quantity ?: result.qty,
+                confirmationText = verified.text,
+            )
+        } else {
+            result.copy(
+                confidence = Confidence.REFUSED,
+                refusalCode = verified.status,
+                confirmationText = verified.text,
+            )
+        }
+        pendingTxId = null
+    }
+
+    /**
+     * Enrolls this device, online, and keeps the secret only long enough to
+     * derive the two sub-keys.
+     */
+    fun enrollDevice() {
+        val backend = backendUrl.trimEnd('/')
+        if (backend.isEmpty()) {
+            enrollmentStatus = "Set a backend URL first — enrollment needs the network."
+            return
+        }
+        enrollmentStatus = "Enrolling…"
+        viewModelScope.launch {
+            BackendApi(backend).enrollDevice(USER_ID)
+                .onSuccess { enrolled ->
+                    runCatching {
+                        deviceKeys.enroll(enrolled.keyId, enrolled.userId, enrolled.secretHex)
+                    }.onSuccess {
+                        enrollmentStatus = "Enrolled as ${enrolled.keyId}"
+                    }.onFailure {
+                        enrollmentStatus = "Could not store the key on this device: ${it.message}"
+                    }
+                }
+                .onFailure { enrollmentStatus = "Enrollment failed: ${it.message}" }
+        }
     }
 
     fun returnToDashboard() {

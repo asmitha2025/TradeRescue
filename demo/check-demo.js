@@ -15,7 +15,7 @@ let code = m[1];
 if (!code.includes("globalThis.__demo")) {
   code = code.replace(
     /\n  reset\(\);\n\}\)\(\);\s*$/,
-    "\n  reset();\n  globalThis.__demo = { serverReceive, buildPacket, holding, get S() { return S; }, reset };\n})();\n",
+    "\n  reset();\n  globalThis.__demo = { serverReceive, buildPacket, holding, deriveSubKey, get S() { return S; }, reset };\n})();\n",
   );
 }
 if (!code.includes("globalThis.__demo")) throw new Error("could not expose internals");
@@ -106,10 +106,12 @@ const check = (name, cond, detail = "") => {
   check("holding unchanged by the duplicate", held("TCS") === before);
   check("only one order on the ledger", D.S.orders.length === 1);
   check("a replay is not logged as a rejection", D.S.rejections.length === 0);
-  check("the replayed check is marked as a replay", second.checks[2].st === "replay");
+  check("the replayed check is marked as a replay",
+    second.checks.some((c) => c.st === "replay"));
 
   console.log("\ntampered replay: same tx_id, different order");
-  const txId = wire.split("|")[1];
+  // TRX3 field order: version, key_id, tx_id, ...
+  const txId = wire.split("|")[2];
   const conflict = await D.buildPacket("TCS", 7, { txId });
   const cr = await D.serverReceive(conflict, "+91");
   check("conflict is refused", cr.ok === false);
@@ -159,14 +161,42 @@ const check = (name, cond, detail = "") => {
   const atFloor = await D.serverReceive(await D.buildPacket("TCS", 1, { floorPaise: 1 }), "+91");
   check("a floor under the price still fills", atFloor.ok === true, atFloor.reason);
 
+  console.log("\ndevice keys");
+  D.reset();
+  const unknownKey = await D.serverReceive(await D.buildPacket("TCS", 1, { keyId: "deadbeef" }), "+91");
+  check("an unknown key id is refused", unknownKey.ok === false && /Unknown signing key/.test(unknownKey.reason), unknownKey.reason);
+  check("an unknown key claims no tx_id", D.S.ledger.size === 0);
+
+  const reflected = await D.serverReceive(await D.buildPacket("TCS", 1, { direction: "resp" }), "+91");
+  check("an order signed with the response sub-key is refused",
+    reflected.ok === false && /Signature/.test(reflected.reason), reflected.reason);
+  check("a wrong-direction signature claims no tx_id", D.S.ledger.size === 0);
+
+  D.S.keyRevoked = true;
+  const revoked = await D.serverReceive(await D.buildPacket("TCS", 1), "+91");
+  check("a revoked key is refused", revoked.ok === false && /revoked/.test(revoked.reason), revoked.reason);
+  check("a revoked key claims no tx_id", D.S.ledger.size === 0);
+  D.S.keyRevoked = false;
+  check("the key works again once it is not revoked", (await D.serverReceive(await D.buildPacket("TCS", 1), "+91")).ok === true);
+
   console.log("\nformat");
   D.reset();
-  const v1 = "TRX|TRX0A1B2C|U10021|S|TCS|5|M|deadbeef|1700000000|" + "0".repeat(32);
-  const v1r = await D.serverReceive(v1, "+91");
-  check("a v1 packet is refused", v1r.ok === false && /TRX2/.test(v1r.reason), v1r.reason);
+  const v2 = "TRX2|TRX0A1B2C|U10021|S|TCS|5|I|0|1700000600|deadbeef|1700000000|" + "0".repeat(32);
+  const v2r = await D.serverReceive(v2, "+91");
+  check("an older TRX2 packet is refused", v2r.ok === false && /TRX3/.test(v2r.reason), v2r.reason);
   const built = await D.buildPacket("TCS", 3);
-  check("packets are TRX2 with 12 fields", built.startsWith("TRX2|") && built.split("|").length === 12);
+  check("packets are TRX3 with 13 fields", built.startsWith("TRX3|") && built.split("|").length === 13);
+  check("the key id is on the wire", built.split("|")[1] === "a1b2c3d4");
   check("packets fit one SMS segment", built.length <= 160, String(built.length));
+
+  console.log("\nkey derivation agrees with the backend");
+  const toHex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+  const req = await D.deriveSubKey("0123456789abcdef".repeat(4), "req");
+  const resp = await D.deriveSubKey("0123456789abcdef".repeat(4), "resp");
+  // The same values firebase/functions/keys.js and Hkdf.kt produce, pinned
+  // in all three so the implementations cannot drift apart.
+  check("request sub-key matches", toHex(req) === "ed3b97cfa228c79340d3978a057001c6cda2d5e7eceab91a740ac20592985c13", toHex(req));
+  check("response sub-key matches", toHex(resp) === "99e19970cafdd5eb6c738840675e7af3a004fd41ffd34be8e969425a98bdebf1", toHex(resp));
 
   console.log(failures === 0 ? "\nAll demo checks passed." : `\n${failures} demo check(s) FAILED.`);
   process.exit(failures === 0 ? 0 : 1);

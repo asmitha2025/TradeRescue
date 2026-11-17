@@ -17,6 +17,32 @@ import kotlin.coroutines.resume
 class BackendApi(baseUrl: String) {
     private val base = baseUrl.trimEnd('/')
 
+    /** What the server hands back when a device enrolls. */
+    data class Enrollment(val keyId: String, val userId: String, val secretHex: String)
+
+    /**
+     * Enrolls this device and receives its secret. Online only, and the one
+     * moment that secret crosses the wire.
+     *
+     * The enrollment token is this demo's stand-in for the authenticated
+     * session a real deployment would require. It is not authentication:
+     * anyone holding it can enroll a device for any user. The README says
+     * so, and Phase 4's login is what replaces it.
+     */
+    suspend fun enrollDevice(userId: String): Result<Enrollment> {
+        val body = JSONObject().apply { put("user_id", userId) }
+            .toString().toRequestBody("application/json".toMediaType())
+        return execute("$base/enroll") {
+            post(body).header("x-enroll-token", ENROLL_TOKEN)
+        }.mapCatching {
+            Enrollment(
+                keyId = it.getString("key_id"),
+                userId = it.getString("user_id"),
+                secretHex = it.getString("device_secret"),
+            )
+        }
+    }
+
     /** The normal path — used when the app is actually online. */
     suspend fun placeNormalOrder(userId: String, symbol: String, action: String, qty: Int): Result<JSONObject> {
         val body = JSONObject().apply {
@@ -99,6 +125,10 @@ class BackendApi(baseUrl: String) {
     }
 
     private companion object {
+        // Matches ENROLL_TOKEN on the backend, which defaults to this. A
+        // constant in source, exactly like DEMO_PIN, and no more secure.
+        const val ENROLL_TOKEN = "demo-enroll"
+
         // One shared client (connection pool + threads) for the whole app.
         // The read timeout is generous because free-tier hosts cold-start.
         val client: OkHttpClient = OkHttpClient.Builder()

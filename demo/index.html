@@ -285,8 +285,8 @@
   </main>
 
   <footer class="foot">
-    <div><strong>This page is a simulation of the server checks</strong>, not the backend running in your browser. The checks below are a second implementation in JavaScript that mirrors the real one in <code>firebase/functions/</code>, in the same order, so you can watch each one decide. Real: the TRX2 packet format and HMAC-SHA256 signing (your browser's Web Crypto), the signature check, the tx_id ledger and its exactly-once replay, expiry, the holdings and per-stock emergency limit, and the optional price floor.</div>
-    <div><strong>What is simulated:</strong> the SMS hop, Firestore, and the exchange. Fills are at the last price, the ledger lives in this tab and resets with the page, and no broker is involved. On real phones the same packet goes out as an actual SMS. The guarantees this page shows are tested for real in the repo's backend test suite — see the README for which test covers which button.</div>
+    <div><strong>This page is a simulation of the server checks</strong>, not the backend running in your browser. The checks below are a second implementation in JavaScript that mirrors the real one in <code>firebase/functions/</code>, in the same order, so you can watch each one decide. Real: the TRX3 packet format, per-device keys with their two HKDF-derived sub-keys and HMAC-SHA256 signing (your browser's Web Crypto), the key-status check, the signature check, the tx_id ledger and its exactly-once replay, expiry, the holdings and per-stock emergency limit, and the optional price floor.</div>
+    <div><strong>What is simulated:</strong> enrollment (this page starts with a device key already issued), the SMS hop, Firestore, and the exchange. Fills are at the last price, the ledger lives in this tab and resets with the page, and no broker is involved. On real phones the same packet goes out as an actual SMS. The guarantees this page shows are tested for real in the repo's backend test suite — see the README for which test covers which button.</div>
     <div>Source: <a href="https://github.com/asmitha2025/TradeRescue" target="_blank" rel="noopener">github.com/asmitha2025/TradeRescue</a></div>
   </footer>
 </div>
@@ -294,7 +294,12 @@
 <script>
 (() => {
   // ---- Shared constants (same values as PacketSigner.kt and packet.js) ----
-  const SECRET = "TRADERESCUE_DEMO_SECRET_NOT_FOR_PRODUCTION";
+  // Enrollment, simulated. The server hands this device a secret once,
+  // over HTTPS, and both ends derive two sub-keys from it with HKDF-SHA256:
+  // one the phone signs orders with, one the server signs confirmations
+  // with. There is no secret shared by every install any more.
+  const DEVICE_SECRET_HEX = "0123456789abcdef".repeat(4);
+  const KEY_ID = "a1b2c3d4";
   const USER = "U10021", PIN = "1234", ME = "+91 98••• ••210";
   // Mirrors packet.js: expires_at is the primary lateness check, and the
   // server takes whichever comes first of it and timestamp + MAX_VALIDITY,
@@ -316,11 +321,32 @@
   const istStamp = () => new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: true, timeZone: "Asia/Kolkata" }).format(new Date()).replace(/[^\x20-\x7e]/g, " ") + " IST";
   const randomHex = (n) => Array.from(crypto.getRandomValues(new Uint8Array(n)), (b) => b.toString(16).padStart(2, "0")).join("");
 
-  // ---- Signing: HMAC-SHA256 truncated to 32 hex chars ----
-  let keyPromise = null;
-  async function sign(payload) {
-    keyPromise = keyPromise || crypto.subtle.importKey("raw", new TextEncoder().encode(SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    const sig = await crypto.subtle.sign("HMAC", await keyPromise, new TextEncoder().encode(payload));
+  // ---- Keys: HKDF-SHA256 sub-keys, then HMAC-SHA256 truncated ----
+  const hexToBytes = (hex) => new Uint8Array(hex.match(/../g).map((b) => parseInt(b, 16)));
+
+  // Matches deriveSubKey in firebase/functions/keys.js and Hkdf.kt in the
+  // app: empty salt, info "TRX3-req" or "TRX3-resp".
+  async function deriveSubKey(secretHex, direction) {
+    const key = await crypto.subtle.importKey("raw", hexToBytes(secretHex), "HKDF", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt: new Uint8Array(32), info: new TextEncoder().encode(`TRX3-${direction}`) },
+      key, 256,
+    );
+    return new Uint8Array(bits);
+  }
+
+  const subKeys = {};
+  async function macKey(direction) {
+    if (!subKeys[direction]) {
+      const raw = await deriveSubKey(DEVICE_SECRET_HEX, direction);
+      subKeys[direction] = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    }
+    return subKeys[direction];
+  }
+
+  /** `direction` is "req" for orders, "resp" for the server's replies. */
+  async function sign(payload, direction = "req") {
+    const sig = await crypto.subtle.sign("HMAC", await macKey(direction), new TextEncoder().encode(payload));
     return Array.from(new Uint8Array(sig), (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
   }
   // SHA-256 of the exact packet bytes: how the server tells a genuine retry
@@ -330,15 +356,18 @@
     return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  // TRX2|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
-  // order_type "I" is immediate-or-cancel; floor is paise, 0 = any price.
-  async function buildPacket(symbol, qty, { tsOffset = 0, floorPaise = 0, validity = DEFAULT_VALIDITY, txId = null } = {}) {
+  // TRX3|key_id|tx_id|user_id|action|symbol|qty|order_type|floor|expires_at|nonce|timestamp|signature
+  // key_id names the device key that signed it, so the server knows which
+  // key to check before it checks anything else. order_type "I" is
+  // immediate-or-cancel; floor is paise, 0 = any price.
+  async function buildPacket(symbol, qty, opts = {}) {
+    const { tsOffset = 0, floorPaise = 0, validity = DEFAULT_VALIDITY, txId = null, keyId = KEY_ID, direction = "req" } = opts;
     const ts = Math.floor(Date.now() / 1000) + tsOffset;
     const payload = [
-      "TRX2", txId || "TRX" + randomHex(3).toUpperCase(), USER, "S", symbol, qty, "I",
+      "TRX3", keyId, txId || "TRX" + randomHex(3).toUpperCase(), USER, "S", symbol, qty, "I",
       floorPaise, ts + validity, randomHex(4), ts,
     ].join("|");
-    return `${payload}|${await sign(payload)}`;
+    return `${payload}|${await sign(payload, direction)}`;
   }
 
   // ---- State ----
@@ -349,6 +378,8 @@
       // tx_id -> { hash, outcome }: the ledger. Every decided packet is in
       // here, filled or refused, and that decision is final.
       ledger: new Map(),
+      // Revocation, so the demo can show a retired device being refused.
+      keyRevoked: false,
       lastGood: null, data: true, screen: "home", sel: null, qty: 1, pin: "", pinErr: "",
       steps: [], packet: null, busy: false, result: null, firstRender: true,
     };
@@ -371,12 +402,16 @@
   // exactly which one decided the packet.
   async function serverReceive(wire, from) {
     const checks = [
-      { name: "Packet format (TRX2)", st: "wait" },
+      { name: "Packet format (TRX3)", st: "wait" },
+      { name: "Device key active", st: "wait" },
       { name: "Signature (HMAC-SHA256)", st: "wait" },
       { name: "tx_id not already decided", st: "wait" },
       { name: "Not expired (expires_at)", st: "wait" },
       { name: "Holding, emergency limit and floor", st: "wait" },
     ];
+    // Indexes shift when a check is added, so they are named rather than
+    // counted.
+    const FORMAT = 0, KEY = 1, SIGNATURE = 2, LEDGER = 3, EXPIRY = 4, LIMITS = 5;
     // Stopped before the ledger: forged, malformed, or reusing a tx_id that
     // belongs to a different order. Nothing like this can claim a tx_id.
     const reject = (i, reason) => {
@@ -388,24 +423,33 @@
 
     const canonical = String(wire).trim();
     const parts = canonical.split("|");
-    if (parts.length !== 12 || parts[0] !== "TRX2") return reject(0, "Not a TRX2 TradeRescue packet");
-    checks[0].st = "ok";
+    if (parts.length !== 13 || parts[0] !== "TRX3") return reject(FORMAT, "Not a TRX3 TradeRescue packet");
+    checks[FORMAT].st = "ok";
 
-    const [, txId, , action, symbol, qtyText, orderType, floorText, expiresText, , tsText, sig] = parts;
-    if ((await sign(parts.slice(0, 11).join("|"))) !== sig) return reject(1, "Signature check failed");
-    checks[1].st = "ok";
+    const [, keyId, txId, , action, symbol, qtyText, orderType, floorText, expiresText, , tsText, sig] = parts;
+
+    // The key is looked up before the signature, because the signature
+    // cannot be checked without knowing which key to check it against. A
+    // key that is unknown or retired stops here, and nothing that stops
+    // here ever claims a tx_id.
+    if (keyId !== KEY_ID) return reject(KEY, "Unknown signing key");
+    if (S.keyRevoked) return reject(KEY, "This device's key has been revoked");
+    checks[KEY].st = "ok";
+
+    if ((await sign(parts.slice(0, 12).join("|"))) !== sig) return reject(SIGNATURE, "Signature check failed");
+    checks[SIGNATURE].st = "ok";
 
     // The ledger lookup. A tx_id that was already decided is never decided
     // again, whatever has changed in the meantime.
     const hash = await hashPacket(canonical);
     const prior = S.ledger.get(txId);
     if (prior) {
-      if (prior.hash !== hash) return reject(2, "This tx_id was already used by a different order");
-      checks[2].st = "replay";
-      for (let j = 3; j < checks.length; j++) checks[j].st = "skip";
+      if (prior.hash !== hash) return reject(LEDGER, "This tx_id was already used by a different order");
+      checks[LEDGER].st = "replay";
+      for (let j = LEDGER + 1; j < checks.length; j++) checks[j].st = "skip";
       return { ...prior.outcome, replayed: true, checks };
     }
-    checks[2].st = "ok";
+    checks[LEDGER].st = "ok";
 
     // Everything from here is terminal: it goes on the ledger, and a retry is
     // answered from that record rather than worked out again.
@@ -417,23 +461,23 @@
     };
     const outcome = (() => {
       const now = Math.floor(Date.now() / 1000), ts = Number(tsText);
-      if (ts - now > MAX_SKEW) return decide(3, "Packet timestamp is in the future");
+      if (ts - now > MAX_SKEW) return decide(EXPIRY, "Packet timestamp is in the future");
       // Whichever comes first: the packet's own expiry, or the server's cap.
       const expiry = Math.min(Number(expiresText), ts + MAX_VALIDITY);
-      if (now > expiry) return decide(3, "Packet expired before it could be executed");
-      checks[3].st = "ok";
+      if (now > expiry) return decide(EXPIRY, "Packet expired before it could be executed");
+      checks[EXPIRY].st = "ok";
 
       const h = holding(symbol), qty = Number(qtyText), floorPaise = Number(floorText);
-      if (action !== "S") return decide(4, "The emergency channel only accepts sell orders");
-      if (orderType !== "I") return decide(4, "The emergency channel places immediate-or-cancel orders only");
-      if (!h) return decide(4, `You do not hold ${symbol}`);
-      if (!Number.isInteger(qty) || qty < 1) return decide(4, "Quantity must be a whole number above zero");
-      if (qty > h.qty) return decide(4, `Only ${h.qty} shares of ${symbol} available`);
-      if (qty > h.limit) return decide(4, `Emergency limit for ${symbol} is ${h.limit} shares`);
+      if (action !== "S") return decide(LIMITS, "The emergency channel only accepts sell orders");
+      if (orderType !== "I") return decide(LIMITS, "The emergency channel places immediate-or-cancel orders only");
+      if (!h) return decide(LIMITS, `You do not hold ${symbol}`);
+      if (!Number.isInteger(qty) || qty < 1) return decide(LIMITS, "Quantity must be a whole number above zero");
+      if (qty > h.qty) return decide(LIMITS, `Only ${h.qty} shares of ${symbol} available`);
+      if (qty > h.limit) return decide(LIMITS, `Emergency limit for ${symbol} is ${h.limit} shares`);
       if (floorPaise > 0 && Math.round(h.price * 100) < floorPaise) {
-        return decide(4, `${symbol} is at Rs ${h.price.toFixed(2)}, below your floor of Rs ${(floorPaise / 100).toFixed(2)}`);
+        return decide(LIMITS, `${symbol} is at Rs ${h.price.toFixed(2)}, below your floor of Rs ${(floorPaise / 100).toFixed(2)}`);
       }
-      checks[4].st = "ok";
+      checks[LIMITS].st = "ok";
 
       h.qty -= qty;
       const proceeds = Math.round(qty * h.price * 100) / 100;

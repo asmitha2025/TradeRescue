@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.traderescue.app.AppViewModel
 import com.traderescue.app.Channel
+import com.traderescue.app.Confidence
 import com.traderescue.app.Screen
 import com.traderescue.app.data.Holding
 import java.text.NumberFormat
@@ -243,6 +244,8 @@ private fun SettingsScreen(vm: AppViewModel, onRequestPermission: (String) -> Un
                 singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                 modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
             )
+            Spacer(Modifier.height(16.dp))
+            DeviceEnrollmentCard(vm)
             Spacer(Modifier.height(16.dp))
             Text(
                 "The number real emergency SMS gets sent to (e.g. your Twilio number, once deployed).",
@@ -514,6 +517,62 @@ private fun ExecutingScreen(vm: AppViewModel) {
     }
 }
 
+
+/**
+ * Enrollment: the one moment this device's key crosses the network.
+ *
+ * It needs to be online, which is the whole point of doing it ahead of
+ * time. A phone that has never enrolled cannot sign an emergency order,
+ * and the moment it needs one is exactly when it cannot enroll.
+ */
+@Composable
+private fun DeviceEnrollmentCard(vm: AppViewModel) {
+    val keyId = vm.deviceKeyId
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+            .padding(14.dp),
+    ) {
+        Text("This device's key", style = MaterialTheme.typography.titleSmall)
+        Text(
+            if (keyId != null) {
+                "Enrolled as $keyId. Orders are signed with a key held in this phone's Keystore and " +
+                    "released only after a fingerprint or the device PIN."
+            } else {
+                "Not enrolled. Enroll once while online; after that the emergency channel works with no " +
+                    "data connection at all."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = mutedColor(),
+            modifier = Modifier.padding(top = 4.dp),
+        )
+        if (vm.enrollmentStatus.isNotEmpty()) {
+            Text(
+                vm.enrollmentStatus,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (vm.enrollmentStatus.startsWith("Enrolled")) StatusOnline else StatusOffline,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+        OutlinedButton(
+            onClick = { vm.enrollDevice() },
+            enabled = vm.isOnline && vm.backendUrl.isNotEmpty(),
+            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+        ) {
+            Text(if (keyId != null) "Re-enroll this device" else "Enroll this device")
+        }
+        if (!vm.isOnline) {
+            Text(
+                "Enrollment needs a data connection.",
+                style = MaterialTheme.typography.bodySmall,
+                color = StatusOffline,
+                modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+    }
+}
+
 @Composable
 private fun SuccessScreen(vm: AppViewModel) {
     val r = vm.saleResult ?: return
@@ -530,23 +589,55 @@ private fun SuccessScreen(vm: AppViewModel) {
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
-            Box(Modifier.size(64.dp).background(if (r.confirmed) StatusOnline else Emergency, CircleShape), contentAlignment = Alignment.Center) {
-                Text("✓", fontSize = 26.sp, color = Color(0xFF06251A))
+            // Four states, and the difference between them is the whole
+            // point of signing the reply. "Executed" is only ever shown for
+            // a confirmation whose tag verified against this device's
+            // response key; a message that arrives but does not verify is
+            // shown as unverified and never as a fill.
+            val mark = when (r.confidence) {
+                Confidence.EXECUTED -> "✓"
+                Confidence.SENT -> "→"
+                Confidence.REFUSED -> "✕"
+                Confidence.UNVERIFIED -> "?"
+            }
+            val tint = when (r.confidence) {
+                Confidence.EXECUTED -> StatusOnline
+                Confidence.UNVERIFIED, Confidence.REFUSED -> Emergency
+                Confidence.SENT -> Emergency
+            }
+            Box(Modifier.size(64.dp).background(tint, CircleShape), contentAlignment = Alignment.Center) {
+                Text(mark, fontSize = 26.sp, color = Color(0xFF06251A))
             }
             Text(
-                if (r.confirmed) "Order executed" else "Order sent",
+                when (r.confidence) {
+                    Confidence.EXECUTED -> "Order executed"
+                    Confidence.SENT -> "Order sent"
+                    Confidence.REFUSED -> "Order refused"
+                    Confidence.UNVERIFIED -> "Unverified message"
+                },
                 style = MaterialTheme.typography.headlineSmall,
                 modifier = Modifier.padding(top = 18.dp, bottom = 8.dp),
             )
             Text(
-                if (r.confirmed)
-                    "Sold ${r.qty} shares of ${r.symbol} at ${rupees(r.price)} — proceeds $proceeds, via $via."
-                else
-                    "Sell ${r.qty} shares of ${r.symbol} went out via $via. Estimated proceeds $proceeds at the last known price; the broker confirms the fill once it processes the packet.",
+                when (r.confidence) {
+                    Confidence.EXECUTED ->
+                        "Sold ${r.qty} shares of ${r.symbol} at ${rupees(r.price)} — proceeds $proceeds, via $via. " +
+                            "The broker's confirmation was signed with this device's key, so this is its word and not somebody else's."
+                    Confidence.SENT ->
+                        "Sell ${r.qty} shares of ${r.symbol} went out via $via. Estimated proceeds $proceeds at the last known price. " +
+                            "This says the message was accepted by the network, not that it was executed — that needs the broker's signed reply."
+                    Confidence.REFUSED ->
+                        "The broker refused this order (${r.refusalCode ?: "no reason given"}) and nothing was sold. " +
+                            "This reply was signed with this device's key."
+                    Confidence.UNVERIFIED ->
+                        "A message arrived about this order, but its signature did not check out, so it is being ignored. " +
+                            "Anybody who knows this number can send a text; only the broker can sign one. Treat the order as still sent, not executed."
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f),
                 textAlign = TextAlign.Center,
             )
+            r.confirmationText?.let { PacketCard(it) }
             r.wirePacket?.let { PacketCard(it) }
         }
         OutlinedButton(onClick = { vm.returnToDashboard() }, modifier = Modifier.fillMaxWidth().height(52.dp)) { Text("Done") }
