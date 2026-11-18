@@ -17,7 +17,6 @@ trusting the channel.**
 > [What is verified](#what-is-verified-and-what-isnt) for exactly what has
 > and has not been tested.
 
-> 📹 **Demo video:** _<!-- paste link here -->_
 
 ---
 
