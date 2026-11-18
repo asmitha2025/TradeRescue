@@ -9,7 +9,8 @@
   "scripts": {
     "test": "node --test",
     "serve": "firebase emulators:start --only functions,firestore,hosting",
-    "deploy": "firebase deploy --only functions,firestore:rules,hosting"
+    "deploy": "firebase deploy --only functions,firestore:rules,hosting",
+    "test:emulator": "firebase emulators:exec --only firestore --project traderescue-emulator \"node emulator-test/firestore.smoke.js\""
   },
   "dependencies": {
     "firebase-admin": "^13.0.0",

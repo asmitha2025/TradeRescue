@@ -101,7 +101,7 @@
     <div class="tile"><div class="label">Portfolio value</div><div class="value brand" id="kValue">–</div><div class="note" id="kValueNote"></div></div>
     <div class="tile"><div class="label">Orders filled</div><div class="value" id="kFilled">–</div><div class="note" id="kFilledNote"></div></div>
     <div class="tile"><div class="label">Received by SMS</div><div class="value" id="kSms">–</div><div class="note">Arrived with no data connection</div></div>
-    <div class="tile"><div class="label">Rejected</div><div class="value" id="kRejected">–</div><div class="note">Forged, replayed or over limit</div></div>
+    <div class="tile"><div class="label">Refused</div><div class="value" id="kRejected">–</div><div class="note" id="kRejectedNote">Forged, expired, over limit or below floor</div></div>
   </section>
 
   <div class="grid">
@@ -215,7 +215,13 @@
     const latest = d.orders[0];
     $("kFilledNote").textContent = latest ? "Latest at " + time(latest.at) : "Waiting for the first order";
     setValue($("kSms"), d.totals.via_sms);
-    setValue($("kRejected"), d.totals.rejected);
+    // Two different failures, shown as one number because a user does not
+    // care which side of the ledger an order was stopped on: `rejected`
+    // never got a tx_id (forged or malformed), `refused` got one and a
+    // terminal reason (expired, over limit, below floor).
+    setValue($("kRejected"), d.totals.rejected + d.totals.refused);
+    $("kRejectedNote").textContent =
+      `${d.totals.rejected} forged or malformed, ${d.totals.refused} refused on the rules`;
 
     // Holdings rows are updated in place (not rebuilt) so the bar slides
     // and the share count flashes when a sell lands.

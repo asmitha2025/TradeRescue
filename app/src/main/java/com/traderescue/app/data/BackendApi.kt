@@ -17,6 +17,33 @@ import kotlin.coroutines.resume
 class BackendApi(baseUrl: String) {
     private val base = baseUrl.trimEnd('/')
 
+    /** What the server hands back when a device enrolls. */
+    data class Enrollment(val keyId: String, val userId: String, val secretHex: String)
+
+    /**
+     * Enrolls this device and receives its secret. Online only, over
+     * HTTPS, and the one moment that secret crosses the wire.
+     *
+     * Needs both a signed-in session and a one-time code. The session says
+     * who is asking; the code says this particular device was authorised
+     * by a human looking at an already signed-in screen. A leaked session
+     * alone cannot silently add a device, and a code alone is useless to
+     * anyone not signed in.
+     */
+    suspend fun enrollDevice(sessionToken: String, code: String): Result<Enrollment> {
+        val body = JSONObject().apply { put("code", code) }
+            .toString().toRequestBody("application/json".toMediaType())
+        return execute("$base/enroll") {
+            post(body).header("Authorization", "Bearer $sessionToken")
+        }.mapCatching {
+            Enrollment(
+                keyId = it.getString("key_id"),
+                userId = it.getString("user_id"),
+                secretHex = it.getString("device_secret"),
+            )
+        }
+    }
+
     /** The normal path — used when the app is actually online. */
     suspend fun placeNormalOrder(userId: String, symbol: String, action: String, qty: Int): Result<JSONObject> {
         val body = JSONObject().apply {

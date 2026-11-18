@@ -3,7 +3,12 @@
     {
       "source": "functions",
       "codebase": "default",
-      "ignore": ["node_modules", "test", "*.log"]
+      "ignore": [
+        "node_modules",
+        "test",
+        "emulator-test",
+        "*.log"
+      ]
     }
   ],
   "firestore": {
@@ -12,16 +17,34 @@
   },
   "hosting": {
     "public": "admin",
-    "ignore": ["firebase.json", "**/.*"],
+    "ignore": [
+      "firebase.json",
+      "**/.*"
+    ],
     "rewrites": [
-      { "source": "/api/**", "function": { "functionId": "api", "region": "asia-south1" } }
+      {
+        "source": "/api/**",
+        "function": {
+          "functionId": "api",
+          "region": "asia-south1"
+        }
+      }
     ]
   },
   "emulators": {
-    "functions": { "port": 5001, "host": "0.0.0.0" },
-    "firestore": { "port": 8080 },
-    "hosting": { "port": 5000 },
-    "ui": { "enabled": true },
+    "functions": {
+      "port": 5001,
+      "host": "0.0.0.0"
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "hosting": {
+      "port": 5000
+    },
+    "ui": {
+      "enabled": true
+    },
     "singleProjectMode": true
   }
 }
