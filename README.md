@@ -414,20 +414,6 @@ folder and press Run.
 Both are saved across restarts. The same screen shows whether the data
 connection is up and whether SMS permission is granted.
 
-## Demo script (about two minutes)
-
-1. Open the app. Point out the green **Online** pill — it reflects the
-   phone's real connectivity.
-2. Tap **Emergency Sell → RELIANCE → 5 → PIN 1234**. Order goes over HTTPS.
-3. Turn on airplane mode, then re-enable only the cellular radio — or just
-   tap the pill to rehearse an outage ("Offline · test").
-4. Repeat the sell. The Executing screen shows each step and the exact
-   signed packet that goes over the air, with its character count.
-5. On a phone with a SIM and an SMS number set, show the message in the
-   phone's own Messages app — that is the proof it left over the radio.
-
-Without a SIM (emulator, tablet) step 5 uses the HTTP fallback or
-simulation, and the app says so on screen rather than pretending.
 
 ## Structure
 
